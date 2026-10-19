@@ -1,0 +1,7 @@
+# Development dependencies for the whole repository (local venv).
+# Each service has its own requirements.txt used by its Docker image.
+-r controller/requirements.txt
+-r worker/requirements.txt
+-r client/requirements.txt
+
+pytest>=8.0

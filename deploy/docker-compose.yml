@@ -1,0 +1,101 @@
+# Run from the repository root:
+#   docker compose --env-file .env -f deploy/docker-compose.yml up --build
+# (or `make up`). Build context is the repo root so `shared/` is available to both images.
+
+x-worker: &worker
+  build:
+    context: ..
+    dockerfile: worker/Dockerfile
+  restart: unless-stopped
+  depends_on:
+    - controller
+  networks: [cloudweave]
+
+x-worker-env: &worker-env
+  CONTROLLER_URL: http://controller:8000
+  INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+  HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-5}
+  STORAGE_DIR: /data/chunks
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [cloudweave]
+
+  controller:
+    build:
+      context: ..
+      dockerfile: controller/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      CHUNK_SIZE_BYTES: ${CHUNK_SIZE_BYTES:-1048576}
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
+      HEARTBEAT_TIMEOUT_SECONDS: ${HEARTBEAT_TIMEOUT_SECONDS:-15}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${CONTROLLER_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [cloudweave]
+
+  worker1:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker1
+      ADVERTISE_URL: http://worker1:8001
+    volumes:
+      - worker1_data:/data/chunks
+
+  worker2:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker2
+      ADVERTISE_URL: http://worker2:8001
+    volumes:
+      - worker2_data:/data/chunks
+
+  worker3:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker3
+      ADVERTISE_URL: http://worker3:8001
+    volumes:
+      - worker3_data:/data/chunks
+
+  worker4:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker4
+      ADVERTISE_URL: http://worker4:8001
+    volumes:
+      - worker4_data:/data/chunks
+
+volumes:
+  postgres_data:
+  worker1_data:
+  worker2_data:
+  worker3_data:
+  worker4_data:
+
+networks:
+  cloudweave:
