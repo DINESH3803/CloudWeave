@@ -1,13 +1,13 @@
 """ORM models for the controller's metadata database."""
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from shared.constants import (
     OBJECT_STATUS_UPLOADING,
-    REPLICA_STATUS_PENDING,
+    REPLICA_STATUS_STORED,
     WORKER_STATUS_ACTIVE,
 )
 
@@ -33,7 +33,11 @@ class StoredObject(Base):
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default=OBJECT_STATUS_UPLOADING)
+    custom_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
     chunks: Mapped[list["Chunk"]] = relationship(
         back_populates="object", cascade="all, delete-orphan", order_by="Chunk.chunk_index"
@@ -49,6 +53,7 @@ class Chunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer)
     size_bytes: Mapped[int] = mapped_column(Integer)
     checksum: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16), default="stored")
 
     object: Mapped[StoredObject] = relationship(back_populates="chunks")
     replicas: Mapped[list["ChunkReplica"]] = relationship(
@@ -62,8 +67,9 @@ class ChunkReplica(Base):
     chunk_id: Mapped[str] = mapped_column(
         ForeignKey("chunks.id", ondelete="CASCADE"), primary_key=True
     )
-    worker_id: Mapped[str] = mapped_column(ForeignKey("workers.id"), primary_key=True)
-    status: Mapped[str] = mapped_column(String(16), default=REPLICA_STATUS_PENDING)
+    worker_id: Mapped[str] = mapped_column(ForeignKey("workers.id", ondelete="CASCADE"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), default=REPLICA_STATUS_STORED)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     chunk: Mapped[Chunk] = relationship(back_populates="replicas")
+    worker: Mapped[Worker] = relationship()

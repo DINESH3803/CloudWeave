@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 
 from app.api import chunks, worker
 from app.core.config import get_settings
+from app.heartbeat.reporter import HeartbeatReporter
+from app.storage.chunk_store import ChunkStore
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +23,15 @@ async def lifespan(_: FastAPI):
         stream=sys.stdout,
     )
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
-    # TODO(next step): create HeartbeatReporter(ChunkStore(...)) and start() it here.
+    store = ChunkStore(settings.storage_dir)
+    reporter = HeartbeatReporter(store, settings)
+    reporter.start()
     logger.info("Worker %s started, storage=%s", settings.worker_id, settings.storage_dir)
-    yield
-    logger.info("Worker %s stopped", settings.worker_id)
+    try:
+        yield
+    finally:
+        reporter.stop()
+        logger.info("Worker %s stopped", settings.worker_id)
 
 
 def create_app() -> FastAPI:

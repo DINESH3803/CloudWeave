@@ -27,3 +27,11 @@ class NoHealthyWorkersError(CloudWeaveError):
 
 class ChecksumMismatchError(CloudWeaveError):
     """Chunk or object data does not match its recorded checksum."""
+
+
+class ConflictError(CloudWeaveError):
+    """The request conflicts with current state."""
+
+
+class InvalidRequestError(CloudWeaveError):
+    """The request is invalid or malformed."""

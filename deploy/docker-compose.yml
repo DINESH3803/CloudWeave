@@ -20,6 +20,7 @@ x-worker-env: &worker-env
 
 services:
   postgres:
+    container_name: postgres
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -36,6 +37,7 @@ services:
     networks: [cloudweave]
 
   controller:
+    container_name: controller
     build:
       context: ..
       dockerfile: controller/Dockerfile
@@ -56,6 +58,7 @@ services:
 
   worker1:
     <<: *worker
+    container_name: worker1
     environment:
       <<: *worker-env
       WORKER_ID: worker1
@@ -65,6 +68,7 @@ services:
 
   worker2:
     <<: *worker
+    container_name: worker2
     environment:
       <<: *worker-env
       WORKER_ID: worker2
@@ -74,6 +78,7 @@ services:
 
   worker3:
     <<: *worker
+    container_name: worker3
     environment:
       <<: *worker-env
       WORKER_ID: worker3
@@ -83,6 +88,7 @@ services:
 
   worker4:
     <<: *worker
+    container_name: worker4
     environment:
       <<: *worker-env
       WORKER_ID: worker4

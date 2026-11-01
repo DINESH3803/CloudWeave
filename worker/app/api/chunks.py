@@ -1,9 +1,11 @@
 """Chunk storage endpoints, called only by the controller."""
+import hashlib
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 
 from app.core.config import get_settings
 from app.storage.chunk_store import ChunkStore
 from shared.constants import INTERNAL_API_PREFIX, INTERNAL_TOKEN_HEADER
+from shared.exceptions import ChunkNotFoundError
 from shared.models import ChunkReport, ChunkVerifyResult
 
 
@@ -27,23 +29,38 @@ router = APIRouter(
 
 @router.put("/{chunk_id}", status_code=204)
 async def put_chunk(chunk_id: str, request: Request, store: ChunkStore = Depends(get_store)):
-    store.write(chunk_id, await request.body())
+    data = await request.body()
+    store.write(chunk_id, data)
+    return Response(status_code=204)
 
 
 @router.get("/{chunk_id}")
 def get_chunk(chunk_id: str, store: ChunkStore = Depends(get_store)):
-    return Response(content=store.read(chunk_id), media_type="application/octet-stream")
+    try:
+        data = store.read(chunk_id)
+        return Response(content=data, media_type="application/octet-stream")
+    except ChunkNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Chunk {chunk_id} not found")
 
 
 @router.delete("/{chunk_id}", status_code=204)
 def delete_chunk(chunk_id: str, store: ChunkStore = Depends(get_store)):
     store.delete(chunk_id)
+    return Response(status_code=204)
 
 
-@router.post("/{chunk_id}/verify", response_model=ChunkVerifyResult)
+@router.api_route("/{chunk_id}/verify", methods=["GET", "POST"], response_model=ChunkVerifyResult)
 def verify_chunk(chunk_id: str, store: ChunkStore = Depends(get_store)):
     """Re-hash the stored chunk and report its checksum and size."""
-    raise NotImplementedError
+    if not store.exists(chunk_id):
+        return ChunkVerifyResult(chunk_id=chunk_id, exists=False)
+    data = store.read(chunk_id)
+    return ChunkVerifyResult(
+        chunk_id=chunk_id,
+        exists=True,
+        checksum=hashlib.sha256(data).hexdigest(),
+        size_bytes=len(data),
+    )
 
 
 @router.get("", response_model=list[ChunkReport])

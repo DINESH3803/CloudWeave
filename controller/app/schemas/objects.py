@@ -1,7 +1,8 @@
 """Request/response schemas for the object APIs."""
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ObjectOut(BaseModel):
@@ -14,7 +15,9 @@ class ObjectOut(BaseModel):
     checksum: str | None = None
     chunk_count: int
     status: str
+    custom_metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+    updated_at: datetime | None = None
 
 
 class ObjectListOut(BaseModel):
