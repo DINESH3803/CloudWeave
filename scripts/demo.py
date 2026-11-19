@@ -220,23 +220,26 @@ def demo_5_worker_failure_and_recovery(client: CloudWeaveClient) -> None:
 
         meta = client.metadata(object_id)
         print(f"   Uploaded object {object_id}:")
+        first_chunk = meta.get("chunks", [])[0]
+        target_worker = first_chunk["replicas"][0]["worker_id"]
+        backup_worker = first_chunk["replicas"][1]["worker_id"]
         for ch in meta.get("chunks", []):
             locs = [r["worker_id"] for r in ch.get("replicas", [])]
             print(f"   - Chunk {ch['chunk_index']} replicas on: {locs}")
 
-        # Stop worker2
-        print("\n2. Stopping container 'worker2' (simulating node crash)...")
-        run_docker_command(["docker", "stop", "worker2"])
-        print("   Container worker2 stopped.")
+        # Stop target worker
+        print(f"\n2. Stopping container '{target_worker}' (simulating node crash of replica host)...")
+        run_docker_command(["docker", "stop", target_worker])
+        print(f"   Container {target_worker} stopped.")
 
-        # Read object while worker2 is down
-        print("\n3. Downloading object while worker2 is DOWN...")
+        # Read object while target_worker is down
+        print(f"\n3. Downloading object while {target_worker} is DOWN...")
         downloaded = client.download(object_id)
-        assert sha256_bytes(downloaded) == original_hash, "Failed to read data while worker2 is down!"
-        print("   SUCCESS: Object downloaded without errors via surviving replicas!")
+        assert sha256_bytes(downloaded) == original_hash, f"Failed to read data while {target_worker} is down!"
+        print(f"   SUCCESS: Object downloaded without errors via surviving replicas (including {backup_worker})!")
 
-        # Wait a short period for controller health monitor
-        print("\n4. Checking cluster status during worker2 downtime...")
+        # Wait a short period for controller health monitor / status
+        print(f"\n4. Checking cluster status during {target_worker} downtime...")
         time.sleep(2)
         try:
             status = client.cluster_status()
@@ -245,24 +248,35 @@ def demo_5_worker_failure_and_recovery(client: CloudWeaveClient) -> None:
         except Exception as e:
             print(f"   Status check note: {e}")
 
-        # Restart worker2
-        print("\n5. Restarting container 'worker2'...")
-        run_docker_command(["docker", "start", "worker2"])
-        print("   Container worker2 started. Waiting for re-registration...")
+        # Restart target worker
+        print(f"\n5. Restarting container '{target_worker}'...")
+        run_docker_command(["docker", "start", target_worker])
+        print(f"   Container {target_worker} started. Waiting for re-registration...")
 
-        # Wait for worker2 to re-register
+        # Wait for target worker to re-register
+        recovered = False
         for _ in range(15):
             time.sleep(2)
             try:
                 status = client.cluster_status()
-                w2 = next((w for w in status.get("workers", []) if w["worker_id"] == "worker2"), None)
-                if w2 and w2.get("status") == "active":
-                    print(f"   Worker2 successfully re-registered! Status: {w2['status']}")
+                tw = next((w for w in status.get("workers", []) if w["worker_id"] == target_worker), None)
+                if tw and tw.get("status") == "active":
+                    print(f"   {target_worker} successfully re-registered! Status: {tw['status']}")
+                    recovered = True
                     break
             except Exception:
                 pass
 
-        print("6. Verification SUCCESS: System handled worker failure, served data, and worker recovered.")
+        # Verify replication factor is maintained
+        print(f"\n6. Checking replication factor maintenance after {target_worker} recovery...")
+        meta_after = client.metadata(object_id)
+        for ch in meta_after.get("chunks", []):
+            reps = ch.get("replicas", [])
+            active_reps = [r for r in reps if r.get("status") == "stored"]
+            print(f"   - Chunk {ch['chunk_index']} ({ch['id']}): {len(active_reps)} stored replicas ({[r['worker_id'] for r in active_reps]})")
+            assert len(active_reps) >= 2, f"Replication factor not maintained for chunk {ch['id']}!"
+
+        print("7. Verification SUCCESS: System handled worker failure, served data via surviving replica, and replication factor is maintained after recovery.")
 
 
 # ==============================================================================
