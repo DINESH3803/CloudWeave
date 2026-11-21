@@ -1,0 +1,127 @@
+CloudWeave: Assignment Compliance Audit (read-only)
+The code meets almost every requirement in the PDF. The two real gaps are the worker-failure demo (5), which does not prove the required behaviour, and the data-integrity demo (6), whose output cannot show that corruption was detected. There is also a live-deployment mismatch that you need to know about before demo day.
+
+What I did:
+
+Read the PDF and all controller, worker, client, demo and test code.
+Ran the 55 tests that use a throwaway SQLite database and fake workers: all passed. I skipped tests/integration, because it uploads and deletes live objects.
+Ran read-only checks on the live stack: GET requests, SELECT queries, logs, and copying container files out with docker cp.
+Uploaded, deleted, stopped and corrupted nothing.
+One disclosure: I ran one docker run --rm on the deploy-controller image to read its files. It was removed automatically and nothing was changed.
+
+A. Current repository state
+Branch / commit: master @ 2141996 ("Edited some demo.py"). There are 12 modified tracked files, plus untracked audit/, controller/app/core/headers.py and 5 test folders.
+CW-08 rollback, in the source code: done.
+objects.py:56 is back to the raw filename="{obj.name}" header.
+controller/app/core/headers.py and tests/unicode/test_unicode_filenames.py are leftover empty files (0 bytes) that nothing imports.
+CW-08 rollback, in the live deployment: not done. The running controller is not the code in the repo:
+The image was built at 09:08 and contains neither CW-07 nor CW-08.
+docker diff controller shows five files copied in by hand afterwards: object_service.py, core/exceptions.py, shared/exceptions.py (CW-07), and api/objects.py plus a full 88-line headers.py (CW-08, at 16:27–16:30). The controller was then restarted at 16:31.
+Live downloads therefore still send the CW-08 header (filename*=UTF-8''…).
+If the controller is recreated from its image without --build, it loses CW-07.
+The workers match the source.
+CW-07: still present and correct. object_service.py:122-197 downloads every chunk to a temporary file and checks each chunk, the total size and the whole-object SHA-256 before any response is sent. The download tests pass.
+CW-05 / CW-06: present.
+CW-05: replication repair re-checks the database on every pass and retries with backoff (replication.py).
+CW-06: uploads skip a worker that fails and try the next one (chunk_service.py:52-127).
+B. PDF compliance matrix
+"Static" means I read the code, "Test" means an existing test that ran without the live stack, and "Live" means the running deployment.
+
+§	Requirement	Status	Evidence
+2/9	1 controller, 4 workers, PostgreSQL, Docker Compose	PASS	Live: all 6 containers up, 4 workers active
+2/9	Persistent worker storage	PASS	Live: named volumes deploy_worker{1..4}_data mounted at /data/chunks
+2/9	No Kubernetes; build, start and use instructions	PASS	Static: README §3–5 and Makefile. (The minikube container on this machine is unrelated and exited.)
+3	Unique ID, name, size, content type, timestamps, checksum, chunk count	PASS	Static models.py; Live object list
+3	Chunk information and storage locations	PASS	Live metadata shows each chunk with its replicas and worker IDs
+3	Custom key-value metadata	PASS	Live: notes.txt carries patched metadata
+3	Content type is meaningful	PARTIAL	The server stores whatever type the client sends. The bundled client always sends application/octet-stream (client.py:23). Live: all 15 objects, notes.txt included, are octet-stream.
+4	1 MB chunks, smaller last chunk, unique IDs, order kept	PASS	Live: 1048576 / 1048576 / 524288 bytes; IDs are {object_id}_{index}; order is enforced by a unique (object, index) constraint and sorting
+4	2 copies on different workers, spread across workers	PASS	Live: no chunk has two copies on one worker; one object spans all 4 workers. Test: alternate-placement tests
+4	Detect a lost copy and restore the replication factor	PASS (implementation)	Static: health_monitor.py marks a worker unhealthy after 15 s and runs repair. Test: replication tests. Not tested live, because that would mean stopping a worker.
+4	Exactly 2 copies in normal operation	PASS with note	Live: 8 of 24 chunks have 3–4 copies, because a worker that rejoins has its old copies counted again. No chunk has fewer than 2. Trimming the extras is out of scope.
+5	All 6 client routes and their success codes	PASS	Static routes. Live: GET, list, metadata, 404s
+5.1	Multipart upload with file and optional metadata; 400 on bad JSON	PASS	Static objects.py:19-40
+5.2	Byte-exact download, Content-Type, 404	PASS (live) / PARTIAL (source)	Live: a 2.5 MB object's SHA-256 matches its stored checksum. In the source, a name outside Latin-1 (for example 文件.bin or an en dash) gives a 500. The live logs at 16:25 show four UnicodeEncodeError 500s at objects.py:53, from the rollback.
+5.4	PATCH metadata without re-upload; 404	PASS	Static; demo 4 history in the live database. The request body must be wrapped as {"custom_metadata": {...}}, which the README documents.
+5.5	DELETE 204 / 404, data removed	PASS (static)	Not tested live (no deletions allowed)
+5.6	List with ID, name, size, type; pagination	PASS	Live
+5.7	Meaningful JSON error messages	PARTIAL	Live: ?limit=-1 returns a plain-text 500. 404 JSON is {"detail":"<uuid>"}, just the ID with no message. 409 is mapped but never raised, which the PDF does not strictly require.
+6	register, heartbeat, PUT/GET/DELETE chunk, list a worker's chunks	PASS	Static. Live: /internal/workers/worker2/chunks returns 15 entries, and returns 401 without the token
+7	Detection; serving from the other copy; repair	PASS (implementation, not tested live)	Static and tests, as above
+7	Demo uses worker2 and shows before, during and after	MISSING	See D-5
+8	Checksum check on read; never returns bad data; read-repair	PASS (implementation)	Static chunk_service.py:153-206. Test: download corruption cases
+8	Demo proves detection and handling	PARTIAL	See D-6
+10	Six demonstrations	4 ready, 2 need fixes	See section D
+C. Actual missing requirements
+§7 / §10, demo 5 does not prove failure handling.
+
+Evidence (demo.py:189-275):
+It stops whichever worker holds chunk 0's first copy, not worker2. Earlier live runs stopped worker3. The README says worker2, so the documentation does not match the script.
+It waits only 2 s during the outage. The heartbeat timeout is 15 s, so every worker still shows active, and neither detection nor repair is ever shown.
+The final check counts copies with status stored, and the restarted worker re-marks its own copies as stored. The check passes even if repair never happened.
+Impact: this is the demo the PDF describes most explicitly. As written it shows a download during an outage and little else.
+Minimum fix (script only):
+Stop worker2, and make sure the test object has a copy there.
+Poll until worker2 is unhealthy (about 20 s) and print the number of usable copies per chunk, counting only copies on workers that are stored and active.
+Download and verify the object.
+Poll until every chunk has 2 usable copies again and print where they are.
+Run docker start worker2, wait for active, and print the final state.
+§8 / §10, demo 6 cannot show that corruption was detected.
+
+Evidence (demo.py:281-327):
+Step 4 prints copy statuses but asserts nothing. After a successful repair both copies show stored, which is exactly what you would see if the corrupt copy had never been read.
+Whether the corrupt copy is read at all depends on the database's row order, because chunk_service.py:160-163 sorts only by worker health. Earlier live runs read it first 10/10 times, but nothing guarantees that.
+Impact: the demo exits 0 without proving detection or repair.
+Minimum fix:
+Run sha256sum on the chunk file inside the target worker before the download (it should not match the stored checksum) and after (it should match), and assert both.
+Make the read order deterministic by also sorting on worker_id in read_chunk, and have the demo corrupt the copy that sorts first.
+§5.7, plain-text 500 responses.
+
+Evidence: there is no catch-all exception handler in core/exceptions.py. A negative limit or offset reaches PostgreSQL and fails there (confirmed live). Names longer than 512 characters fail the same way.
+Impact: low to medium. A grader who probes error handling sees a non-JSON error.
+Minimum fix:
+Add a catch-all Exception handler that returns a JSON 500.
+Use Query(ge=0) for offset and Query(ge=1, le=1000) for limit.
+Change the 404 message to "Object {id} not found".
+§3 / §5.2, content type is always application/octet-stream through the bundled client and demo.
+
+Evidence: client.py:23. Live: every stored object is octet-stream, including notes.txt.
+Minimum fix: one line in the client using mimetypes.guess_type(path.name)[0] or "application/octet-stream".
+§5.2, names outside Latin-1 cannot be downloaded (this is your call, since you rolled CW-08 back on purpose).
+
+Evidence: objects.py:56. The live logs show the 500s.
+Impact: only if a grader uploads such a name. résumé.pdf works because é is in Latin-1; Chinese characters, emoji and en dashes do not.
+Minimum fix: about two lines that build the header with urllib.parse.quote: an ASCII filename= fallback plus filename*=UTF-8''…. That is far smaller than the 88-line module that was rolled back. The client already reads the fallback filename="…".
+Deployment drift (operational, not a code change).
+
+The live controller is the 09:08 image plus hand-copied files, including CW-08.
+Fix: run docker compose --env-file .env -f deploy/docker-compose.yml up -d --build. Do not use -v, so the data is kept. After that, the live stack matches the source.
+The following are not required by the PDF, and I would not fix them: trimming extra copies, cleaning up orphan files (worker2 has 16 files on disk but 15 tracked copies), a periodic integrity scan, using 409, and authentication.
+
+One optional one-line hardening for §8: when a worker rejoins, registry.py:21-25 marks every chunk it reports as stored without comparing the checksum the worker sends. Comparing report.checksum with chunk.checksum and marking mismatches corrupt would stop a corrupt copy from rejoining as healthy.
+
+D. Six-demonstration readiness
+Demo	Readiness	Reason
+1. Object storage	Ready	SHA-256 equality is asserted
+2. Chunking and distribution	Ready	A 2.5 MB file becomes 3 chunks with locations printed. Live data shows the chunks spread across all 4 workers.
+3. Replication	Ready	Asserts exactly 2 copies on different workers for a freshly uploaded object
+4. Metadata	Ready	Patch merges and keeps existing keys, and the bytes are unchanged. Cosmetic issue: it shows octet-stream for a .txt file.
+5. Worker failure	Not ready	Wrong target worker; no visible during-outage state; no detection or repair shown; the final check passes regardless
+6. Data integrity	Needs a small fix	Behaviour is correct, but the demo asserts nothing that proves detection or repair
+E. Minimal remediation plan
+Rebuild, without code changes: docker compose … up -d --build (no -v), so the live stack matches the source. Do this after steps 2–3 and before the demo.
+Demo fixes (one prompt):
+Rewrite demo 5 as in C1.
+Strengthen demo 6 as in C2: sha256sum checks before and after, plus the deterministic read order in read_chunk.
+Correct the README's description of demo 5.
+Small API fixes (one prompt):
+JSON catch-all 500 handler, bounds on offset/limit, and a clearer 404 message.
+Client guesses the MIME type from the file name.
+Optionally: the two-line UTF-8 Content-Disposition header (C5) and the checksum comparison on worker rejoin.
+Rehearse: after the rebuild, run python scripts/demo.py once against the live stack.
+F. Final verdict
+Ready after a few small fixes. Every required behaviour is implemented, but demos 5 and 6 do not yet prove what the PDF asks them to show.
+
+I recommend 2 implementation prompts: step 2 (demo fixes) and step 3 (API fixes), followed by the rebuild and a full demo run.
+
+I have not changed any files. I'm waiting for your review.

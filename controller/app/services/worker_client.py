@@ -16,7 +16,10 @@ class WorkerClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._client = httpx.Client(
-            timeout=self.settings.worker_request_timeout_seconds,
+            timeout=httpx.Timeout(
+                self.settings.worker_request_timeout_seconds,
+                connect=self.settings.worker_connect_timeout_seconds,
+            ),
             headers={INTERNAL_TOKEN_HEADER: self.settings.internal_api_token},
         )
 
@@ -46,10 +49,10 @@ class WorkerClient:
             logger.warning("Failed to GET chunk %s from worker %s: %s", chunk_id, base_url, e)
             raise WorkerUnavailableError(f"Failed to GET chunk {chunk_id} from {base_url}: {e}") from e
 
-    def delete_chunk(self, base_url: str, chunk_id: str) -> None:
+    def delete_chunk(self, base_url: str, chunk_id: str, timeout: float | None = None) -> None:
         url = self._url(base_url, f"/chunks/{chunk_id}")
         try:
-            resp = self._client.delete(url)
+            resp = self._client.delete(url, timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT)
             if resp.status_code not in (200, 204, 404):
                 resp.raise_for_status()
         except httpx.HTTPError as e:

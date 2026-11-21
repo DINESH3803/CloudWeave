@@ -5,3 +5,4 @@
 -r client/requirements.txt
 
 pytest>=8.0
+

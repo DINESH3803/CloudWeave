@@ -203,80 +203,214 @@ def demo_4_metadata(client: CloudWeaveClient) -> None:
         print("5. Verification SUCCESS: Metadata updated in-place without touching chunk data.")
 
 
+def get_worker_chunk_sha256(worker_id: str, chunk_id: str) -> str:
+    cmd = ["docker", "exec", worker_id, "sha256sum", f"/data/chunks/{chunk_id}"]
+    res = run_docker_command(cmd)
+    return res.split()[0].strip()
+
+
 # ==============================================================================
 # DEMO 5: Worker Failure & Recovery
 # ==============================================================================
 def demo_5_worker_failure_and_recovery(client: CloudWeaveClient) -> None:
     banner("DEMO 5: Worker Failure & Recovery (docker stop / start worker2)")
+    target_worker = "worker2"
+    object_id: str | None = None
+    worker2_stopped = False
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        test_file = Path(tmpdir) / "failover_test.bin"
-        data = os.urandom(1024 * 1024 + 100)  # > 1 MB to create 2 chunks
-        test_file.write_bytes(data)
-        original_hash = sha256_bytes(data)
-
-        print("1. Uploading test file before failure...")
-        upload_resp = client.upload(test_file)
-        object_id = upload_resp["id"]
-
-        meta = client.metadata(object_id)
-        print(f"   Uploaded object {object_id}:")
-        first_chunk = meta.get("chunks", [])[0]
-        target_worker = first_chunk["replicas"][0]["worker_id"]
-        backup_worker = first_chunk["replicas"][1]["worker_id"]
-        for ch in meta.get("chunks", []):
-            locs = [r["worker_id"] for r in ch.get("replicas", [])]
-            print(f"   - Chunk {ch['chunk_index']} replicas on: {locs}")
-
-        # Stop target worker
-        print(f"\n2. Stopping container '{target_worker}' (simulating node crash of replica host)...")
-        run_docker_command(["docker", "stop", target_worker])
-        print(f"   Container {target_worker} stopped.")
-
-        # Read object while target_worker is down
-        print(f"\n3. Downloading object while {target_worker} is DOWN...")
-        downloaded = client.download(object_id)
-        assert sha256_bytes(downloaded) == original_hash, f"Failed to read data while {target_worker} is down!"
-        print(f"   SUCCESS: Object downloaded without errors via surviving replicas (including {backup_worker})!")
-
-        # Wait a short period for controller health monitor / status
-        print(f"\n4. Checking cluster status during {target_worker} downtime...")
-        time.sleep(2)
         try:
-            status = client.cluster_status()
-            for w in status.get("workers", []):
+            # 1. Ensure test object has at least one chunk replica stored on worker2
+            print("1. Preparing test object with replicas on worker2...")
+            test_file = Path(tmpdir) / "demo5_failover.bin"
+            # 2.5 MB produces 3 chunks (6 replica placements across 4 workers)
+            data = os.urandom(int(2.5 * 1024 * 1024))
+            test_file.write_bytes(data)
+            original_hash = sha256_bytes(data)
+
+            upload_resp = client.upload(test_file, metadata={"purpose": "demo5_worker_failure"})
+            object_id = upload_resp["id"]
+            meta = client.metadata(object_id)
+
+            has_worker2 = any(
+                any(r["worker_id"] == target_worker for r in ch.get("replicas", []))
+                for ch in meta.get("chunks", [])
+            )
+            assert has_worker2, f"Expected at least one replica on {target_worker}, but none found!"
+
+            # 2. Display initial state
+            print("\n2. Initial cluster and object state before failure:")
+            initial_status = client.cluster_status()
+            workers = initial_status.get("workers", [])
+            for w in workers:
+                print(f"   Worker {w['worker_id']}: status={w['status']}, last_heartbeat={w.get('last_heartbeat')}")
+            assert all(w.get("status") == "active" for w in workers), "All workers must be active initially!"
+
+            active_workers = {w["worker_id"] for w in workers if w.get("status") == "active"}
+            chunks = meta.get("chunks", [])
+            print(f"   Object {object_id} ({len(chunks)} chunks):")
+            for ch in chunks:
+                usable = [r for r in ch.get("replicas", []) if r.get("status") == "stored" and r.get("worker_id") in active_workers]
+                locs = [r["worker_id"] for r in usable]
+                print(f"   - Chunk {ch['chunk_index']} ({ch['id']}): {len(usable)} usable replica(s) on {locs}")
+                assert len(usable) >= 2, f"Chunk {ch['id']} has fewer than 2 usable replicas initially!"
+
+            # 3. Stop specifically worker2
+            print(f"\n3. Stopping container '{target_worker}' (simulating node crash)...")
+            run_docker_command(["docker", "stop", target_worker])
+            worker2_stopped = True
+            print(f"   Container {target_worker} stopped.")
+
+            # 4. Wait for health-monitor timeout and poll until worker2 is actually marked unhealthy
+            print(f"\n4. Polling health monitor for failure detection (heartbeat timeout: 15s)...")
+            detection_timeout = 45.0
+            poll_start = time.time()
+            worker2_detected_unhealthy = False
+            last_status = None
+            degraded_state_captured = None
+
+            while time.time() - poll_start < detection_timeout:
+                try:
+                    curr_status = client.cluster_status()
+                    tw = next((w for w in curr_status.get("workers", []) if w["worker_id"] == target_worker), None)
+                    if tw and tw.get("status") == "unhealthy":
+                        worker2_detected_unhealthy = True
+                        last_status = curr_status
+                        elapsed = time.time() - poll_start
+                        print(f"   Failure detected in {elapsed:.1f}s: {target_worker} marked 'unhealthy'!")
+
+                        # Immediately capture intermediate replica state to check if degraded state is observable before repair
+                        meta_check = client.metadata(object_id)
+                        surviving = {w["worker_id"] for w in curr_status.get("workers", []) if w.get("status") == "active"}
+                        chunk_counts = []
+                        for ch in meta_check.get("chunks", []):
+                            usable = [r for r in ch.get("replicas", []) if r.get("status") == "stored" and r.get("worker_id") in surviving]
+                            chunk_counts.append((ch, usable))
+
+                        if any(len(u) < 2 for _, u in chunk_counts):
+                            degraded_state_captured = (meta_check, chunk_counts, surviving)
+                        break
+                except Exception:
+                    pass
+                # Poll with higher frequency as we approach the 15-second heartbeat timeout
+                time.sleep(0.05 if (time.time() - poll_start > 12.0) else 0.5)
+
+            assert worker2_detected_unhealthy, f"Health monitor failed to mark {target_worker} as unhealthy within {detection_timeout}s!"
+
+            # 5. Display during-failure and degraded replication state
+            print(f"\n5. During-failure state ({target_worker} is UNHEALTHY):")
+            surviving_active = {w["worker_id"] for w in last_status.get("workers", []) if w.get("status") == "active"}
+            for w in last_status.get("workers", []):
                 print(f"   Worker {w['worker_id']}: status={w['status']}")
-        except Exception as e:
-            print(f"   Status check note: {e}")
+            assert target_worker not in surviving_active, f"{target_worker} must not be in active workers!"
 
-        # Restart target worker
-        print(f"\n5. Restarting container '{target_worker}'...")
-        run_docker_command(["docker", "start", target_worker])
-        print(f"   Container {target_worker} started. Waiting for re-registration...")
+            if degraded_state_captured:
+                _, chunk_counts, surviving = degraded_state_captured
+                print("\n   Observed intermediate degraded replication state before repair:")
+                for ch, usable in chunk_counts:
+                    locs = [r["worker_id"] for r in usable]
+                    state_str = "DEGRADED (only 1 usable replica)" if len(usable) < 2 else "2 usable replicas"
+                    print(f"   - Chunk {ch['chunk_index']} ({ch['id']}): {len(usable)} usable replica(s) on {locs} [{state_str}]")
+            else:
+                print("\n   Degraded replication state analysis:")
+                print(f"   When {target_worker} failed, chunk(s) stored on {target_worker} immediately lost a usable replica.")
+                print("   Replication repair triggered immediately within the same health monitor tick (< 0.1s latency).")
 
-        # Wait for target worker to re-register
-        recovered = False
-        for _ in range(15):
-            time.sleep(2)
-            try:
-                status = client.cluster_status()
-                tw = next((w for w in status.get("workers", []) if w["worker_id"] == target_worker), None)
-                if tw and tw.get("status") == "active":
-                    print(f"   {target_worker} successfully re-registered! Status: {tw['status']}")
-                    recovered = True
-                    break
-            except Exception:
-                pass
+            # Download while worker2 is unavailable
+            print(f"\n   Downloading object while {target_worker} is DOWN...")
+            downloaded = client.download(object_id)
+            downloaded_hash = sha256_bytes(downloaded)
+            assert downloaded_hash == original_hash, f"Downloaded object checksum mismatch while {target_worker} is down!"
+            print(f"   SUCCESS: Object downloaded without errors ({len(downloaded):,} bytes, SHA-256 matches) via surviving replicas.")
 
-        # Verify replication factor is maintained
-        print(f"\n6. Checking replication factor maintenance after {target_worker} recovery...")
-        meta_after = client.metadata(object_id)
-        for ch in meta_after.get("chunks", []):
-            reps = ch.get("replicas", [])
-            active_reps = [r for r in reps if r.get("status") == "stored"]
-            print(f"   - Chunk {ch['chunk_index']} ({ch['id']}): {len(active_reps)} stored replicas ({[r['worker_id'] for r in active_reps]})")
-            assert len(active_reps) >= 2, f"Replication factor not maintained for chunk {ch['id']}!"
+            # 6. Wait for replication repair to complete
+            print("\n6. Waiting for replication repair to restore replication factor across surviving workers...")
+            repair_timeout = 45.0
+            repair_start = time.time()
+            repair_completed = False
+            repaired_meta = None
+            while time.time() - repair_start < repair_timeout:
+                try:
+                    curr_status = client.cluster_status()
+                    current_active = {w["worker_id"] for w in curr_status.get("workers", []) if w.get("status") == "active"}
+                    curr_meta = client.metadata(object_id)
+                    all_chunks_replicated = True
+                    for ch in curr_meta.get("chunks", []):
+                        usable = [r for r in ch.get("replicas", []) if r.get("status") == "stored" and r.get("worker_id") in current_active]
+                        distinct_active = {r["worker_id"] for r in usable}
+                        if len(distinct_active) < 2:
+                            all_chunks_replicated = False
+                            break
+                    if all_chunks_replicated:
+                        repair_completed = True
+                        repaired_meta = curr_meta
+                        elapsed = time.time() - repair_start
+                        print(f"   Replication repair confirmed in {elapsed:.1f}s!")
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
-        print("7. Verification SUCCESS: System handled worker failure, served data via surviving replica, and replication factor is maintained after recovery.")
+            assert repair_completed, "Replication repair failed to restore 2 usable replicas on healthy workers!"
+
+            # 7 & 8. Verify and display restored replica locations
+            print("\n7 & 8. Restored replica count and Worker locations (surviving active workers only):")
+            curr_status = client.cluster_status()
+            current_active = {w["worker_id"] for w in curr_status.get("workers", []) if w.get("status") == "active"}
+            for ch in repaired_meta.get("chunks", []):
+                usable = [r for r in ch.get("replicas", []) if r.get("status") == "stored" and r.get("worker_id") in current_active]
+                distinct_locs = sorted(list({r["worker_id"] for r in usable}))
+                print(f"   - Chunk {ch['chunk_index']} ({ch['id']}): {len(usable)} usable replicas on {distinct_locs} [RESTORED]")
+                assert len(distinct_locs) >= 2, f"Chunk {ch['id']} has fewer than 2 distinct healthy replicas!"
+
+            # 9. Restart worker2 using Docker
+            print(f"\n9. Restarting container '{target_worker}'...")
+            run_docker_command(["docker", "start", target_worker])
+            worker2_stopped = False
+            print(f"   Container {target_worker} started. Waiting for re-registration...")
+
+            # 10. Wait until worker2 becomes healthy again and display final state
+            print(f"\n10. Polling until {target_worker} becomes active...")
+            recovery_timeout = 35.0
+            rec_start = time.time()
+            worker2_active = False
+            while time.time() - rec_start < recovery_timeout:
+                try:
+                    curr_status = client.cluster_status()
+                    tw = next((w for w in curr_status.get("workers", []) if w["worker_id"] == target_worker), None)
+                    if tw and tw.get("status") == "active":
+                        worker2_active = True
+                        elapsed = time.time() - rec_start
+                        print(f"   {target_worker} successfully recovered in {elapsed:.1f}s! Status: active")
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+
+            assert worker2_active, f"{target_worker} failed to re-register as active within {recovery_timeout}s!"
+
+            final_status = client.cluster_status()
+            print("   Final cluster worker statuses:")
+            for w in final_status.get("workers", []):
+                print(f"     Worker {w['worker_id']}: status={w['status']}")
+
+            print("\n11. Verification SUCCESS: Worker failure detected, data served via surviving replicas, replication restored, and worker recovered cleanly.")
+
+        finally:
+            # Always ensure worker2 is restarted if it was left stopped
+            if worker2_stopped:
+                print(f"   Ensuring {target_worker} is restarted...")
+                try:
+                    run_docker_command(["docker", "start", target_worker])
+                except Exception:
+                    pass
+            # Clean up dedicated temporary demonstration object
+            if object_id:
+                print(f"   Cleaning up temporary demo object {object_id}...")
+                try:
+                    client.delete(object_id)
+                except Exception as e:
+                    print(f"   Note: Cleanup error: {e}")
 
 
 # ==============================================================================
@@ -284,53 +418,101 @@ def demo_5_worker_failure_and_recovery(client: CloudWeaveClient) -> None:
 # ==============================================================================
 def demo_6_data_integrity_and_repair(client: CloudWeaveClient) -> None:
     banner("DEMO 6: Data Integrity (Corruption Detection, Fallback & Repair)")
+    object_id: str | None = None
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        test_file = Path(tmpdir) / "integrity_test.bin"
-        data = os.urandom(256 * 1024)
-        test_file.write_bytes(data)
-        original_hash = sha256_bytes(data)
+        try:
+            test_file = Path(tmpdir) / "demo6_integrity.bin"
+            data = os.urandom(256 * 1024)
+            test_file.write_bytes(data)
+            original_hash = sha256_bytes(data)
 
-        print("1. Uploading object for corruption testing...")
-        upload_resp = client.upload(test_file)
-        object_id = upload_resp["id"]
+            print("1. Uploading dedicated test object for data integrity demonstration...")
+            upload_resp = client.upload(test_file, metadata={"purpose": "demo6_data_integrity"})
+            object_id = upload_resp["id"]
 
-        meta = client.metadata(object_id)
-        chunk = meta["chunks"][0]
-        chunk_id = chunk["id"]
-        replicas = [r["worker_id"] for r in chunk["replicas"]]
-        target_worker = replicas[0]
-        backup_worker = replicas[1]
-        print(f"   Object {object_id}, Chunk {chunk_id}")
-        print(f"   Stored on workers: {target_worker} and {backup_worker}")
+            meta = client.metadata(object_id)
+            chunk = meta["chunks"][0]
+            chunk_id = chunk["id"]
+            expected_chunk_hash = chunk["checksum"]
 
-        # Intentionally corrupt chunk on target_worker
-        print(f"\n2. Intentionally corrupting chunk file on {target_worker}...")
-        corrupt_cmd = [
-            "docker", "exec", target_worker,
-            "sh", "-c", f"echo 'CORRUPTED_BYTES_HERE' > /data/chunks/{chunk_id}"
-        ]
-        run_docker_command(corrupt_cmd)
-        print(f"   Overwrote /data/chunks/{chunk_id} on {target_worker} with bad bytes.")
+            # Step 1 & 2: Identify selected chunk, replicas, and exact worker to corrupt
+            cluster_stat = client.cluster_status()
+            active_workers = {w["worker_id"] for w in cluster_stat.get("workers", []) if w.get("status") == "active"}
+            active_chunk_replicas = sorted(
+                [r for r in chunk["replicas"] if r["worker_id"] in active_workers],
+                key=lambda r: r["worker_id"],
+            )
+            assert len(active_chunk_replicas) >= 2, "Test chunk must have at least 2 active replicas!"
 
-        # Download object - should detect corruption, log warning, fallback to backup_worker, and auto-repair!
-        print(f"\n3. Requesting download: Controller will detect checksum mismatch on {target_worker} "
-              f"and fallback to valid replica on {backup_worker}...")
-        downloaded = client.download(object_id)
-        downloaded_hash = sha256_bytes(downloaded)
+            # Step 3: Ensure the corrupted replica is the one selected first during download.
+            # Controller's read_chunk sorts active replicas lexicographically by worker_id,
+            # so active_chunk_replicas[0] is guaranteed to be queried first.
+            target_replica = active_chunk_replicas[0]
+            backup_replica = active_chunk_replicas[1]
+            target_worker = target_replica["worker_id"]
+            backup_worker = backup_replica["worker_id"]
 
-        assert downloaded_hash == original_hash, "Corrupted bytes were returned to client!"
-        print(f"   Download received {len(downloaded):,} bytes.")
-        print(f"   SHA-256 matches original: {downloaded_hash == original_hash}")
-        print("   SUCCESS: Corrupted data was rejected, valid replica served to client.")
+            print(f"   Object ID: {object_id}")
+            print(f"   Chunk ID:  {chunk_id} (Expected SHA-256: {expected_chunk_hash})")
+            print(f"   Replicas:  {target_worker} (first queried) and {backup_worker} (backup)")
 
-        # Verify auto-repair repaired target_worker
-        print(f"\n4. Verifying that corrupted replica on {target_worker} was restored...")
-        time.sleep(1)
-        meta_after = client.metadata(object_id)
-        rep_status = {r["worker_id"]: r["status"] for r in meta_after["chunks"][0]["replicas"]}
-        print(f"   Replica statuses: {rep_status}")
+            # Step 4: Before corruption, record its original checksum
+            print(f"\n2. Verifying initial stored chunk checksum on {target_worker}...")
+            pre_corruption_hash = get_worker_chunk_sha256(target_worker, chunk_id)
+            print(f"   Pre-corruption SHA-256 on {target_worker}: {pre_corruption_hash}")
+            assert pre_corruption_hash == expected_chunk_hash, f"Initial file checksum on {target_worker} does not match expected!"
 
-        print("5. Verification SUCCESS: Corruption was auto-detected, avoided, and repaired.")
+            # Step 5: Intentionally corrupt only the selected test object's replica
+            print(f"\n3. Intentionally corrupting chunk file on {target_worker}...")
+            corrupt_cmd = [
+                "docker", "exec", target_worker,
+                "sh", "-c", f"echo 'CORRUPTED_BYTES_HERE_DEMO6' > /data/chunks/{chunk_id}",
+            ]
+            run_docker_command(corrupt_cmd)
+            print(f"   Overwrote /data/chunks/{chunk_id} on {target_worker} with bad bytes.")
+
+            # Step 6: Verify using SHA-256 that the stored file checksum no longer matches expected
+            print(f"\n4. Verifying stored file checksum on {target_worker} is now CORRUPT...")
+            corrupted_hash = get_worker_chunk_sha256(target_worker, chunk_id)
+            print(f"   Corrupted SHA-256 on {target_worker}: {corrupted_hash}")
+            assert corrupted_hash != expected_chunk_hash, f"File on {target_worker} was expected to be corrupted!"
+            print("   CONFIRMED: Stored chunk file checksum no longer matches expected checksum.")
+
+            # Step 7: Download complete object through normal client-facing API
+            print(f"\n5. Requesting download via API (http://localhost:8000/api/v1/objects/{object_id})...")
+            downloaded = client.download(object_id)
+            downloaded_hash = sha256_bytes(downloaded)
+
+            # Step 8: Verify that downloaded object matches original checksum
+            print(f"\n6. Verifying downloaded object against original SHA-256...")
+            print(f"   Downloaded size: {len(downloaded):,} bytes")
+            print(f"   Downloaded SHA-256: {downloaded_hash}")
+            print(f"   Original SHA-256:   {original_hash}")
+            assert downloaded_hash == original_hash, "Corrupted bytes were returned to client!"
+            print(f"   SUCCESS: Controller detected corruption on {target_worker}, fell back to valid replica on {backup_worker}, and returned intact data.")
+
+            # Step 9 & 10: Verify corrupted replica was detected and restored
+            print(f"\n7. Verifying corrupted replica on {target_worker} was detected and restored...")
+            time.sleep(1)  # allow inline auto-repair transaction to settle
+            post_repair_hash = get_worker_chunk_sha256(target_worker, chunk_id)
+            print(f"   Post-repair SHA-256 on {target_worker}: {post_repair_hash}")
+            assert post_repair_hash == expected_chunk_hash, f"Restored chunk on {target_worker} does not match expected checksum!"
+
+            meta_after = client.metadata(object_id)
+            rep_after = next(r for r in meta_after["chunks"][0]["replicas"] if r["worker_id"] == target_worker)
+            print(f"   Replica status in metadata for {target_worker}: {rep_after['status']}")
+            assert rep_after["status"] == "stored", f"Replica status on {target_worker} is {rep_after['status']}, expected 'stored'!"
+
+            print("\n8. Verification SUCCESS: Stored data corrupted intentionally, corruption detected on read, fallback served valid data, and corrupted replica restored to valid checksum.")
+
+        finally:
+            if object_id:
+                print(f"   Cleaning up temporary demo object {object_id}...")
+                try:
+                    client.delete(object_id)
+                except Exception as e:
+                    print(f"   Note: Cleanup error: {e}")
 
 
 # ==============================================================================

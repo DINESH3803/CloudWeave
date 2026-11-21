@@ -1,5 +1,7 @@
 """Python client for the CloudWeave controller REST API."""
 import json
+import mimetypes
+import urllib.parse
 from pathlib import Path
 from typing import Any
 import httpx
@@ -19,8 +21,12 @@ class CloudWeaveClient:
         if metadata:
             data["metadata"] = json.dumps(metadata)
 
+        content_type, _ = mimetypes.guess_type(path.name)
+        if not content_type:
+            content_type = "application/octet-stream"
+
         with open(path, "rb") as f:
-            files = {"file": (path.name, f, "application/octet-stream")}
+            files = {"file": (path.name, f, content_type)}
             resp = self._http.post("/api/v1/objects", files=files, data=data)
             resp.raise_for_status()
             return resp.json()
@@ -34,7 +40,17 @@ class CloudWeaveClient:
             if dest_path.is_dir():
                 filename = "downloaded_file"
                 cd = resp.headers.get("content-disposition", "")
-                if 'filename="' in cd:
+                if "filename*=" in cd:
+                    part = cd.split("filename*=", 1)[1].split(";")[0].strip().strip('"')
+                    if "''" in part:
+                        encoding, encoded = part.split("''", 1)
+                        try:
+                            filename = urllib.parse.unquote(encoded, encoding=encoding or "utf-8")
+                        except Exception:
+                            filename = urllib.parse.unquote(encoded)
+                    else:
+                        filename = urllib.parse.unquote(part)
+                elif 'filename="' in cd:
                     filename = cd.split('filename="')[1].split('"')[0]
                 dest_path = dest_path / filename
             dest_path.parent.mkdir(parents=True, exist_ok=True)
