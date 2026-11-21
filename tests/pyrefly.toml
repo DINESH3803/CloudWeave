@@ -1,0 +1,11 @@
+# Pyrefly (IDE type checker) configuration for the test suite only.
+#
+# The tests import the controller as `app.*` and the shared/client packages from the
+# repository root, exactly as tests/conftest.py arranges at runtime:
+#   sys.path = [<repo root>, <repo root>/controller, ...]
+# Mirror that here so static analysis resolves the same modules.
+#
+# This file is deliberately scoped to tests/: the worker has its own top-level `app`
+# package (worker/app), so adding `controller` to a repository-wide search path would
+# make worker sources resolve `app.*` to the controller.
+search-path = ["..", "../controller"]

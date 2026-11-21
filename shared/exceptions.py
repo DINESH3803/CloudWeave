@@ -8,6 +8,14 @@ class CloudWeaveError(Exception):
 class ObjectNotFoundError(CloudWeaveError):
     """The requested object does not exist."""
 
+    def __init__(self, object_id: str | None = None) -> None:
+        self.object_id = object_id
+        if object_id:
+            msg = object_id if object_id.startswith("Object ") else f"Object {object_id} not found"
+        else:
+            msg = "Object not found"
+        super().__init__(msg)
+
 
 class ChunkNotFoundError(CloudWeaveError):
     """The requested chunk does not exist on the worker / in metadata."""
@@ -35,3 +43,7 @@ class ConflictError(CloudWeaveError):
 
 class InvalidRequestError(CloudWeaveError):
     """The request is invalid or malformed."""
+
+
+class ObjectIntegrityError(CloudWeaveError):
+    """Reconstructed object fails size or checksum validation."""
