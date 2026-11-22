@@ -1,4 +1,12 @@
-"""ORM models for the controller's metadata database."""
+"""
+ORM Models for Controller Metadata Database.
+
+Defines the relational schema:
+- Worker: Registered storage nodes, heartbeat times, status, disk usage.
+- StoredObject: High-level objects uploaded by clients, hashes, custom metadata.
+- Chunk: Fixed-size 1 MB subdivisions of an object.
+- ChunkReplica: Join table mapping chunks to worker nodes (replication factor 2).
+"""
 from datetime import datetime
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint, func
@@ -13,6 +21,11 @@ from shared.constants import (
 
 
 class Worker(Base):
+    """
+    Worker node database entity.
+    
+    Tracks a storage node's network address, health status, capacity, and last heartbeat.
+    """
     __tablename__ = "workers"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -24,6 +37,12 @@ class Worker(Base):
 
 
 class StoredObject(Base):
+    """
+    Stored object database entity.
+    
+    Represents a client-uploaded file with name, overall size, composite checksum,
+    custom JSON metadata, and timestamps.
+    """
     __tablename__ = "objects"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -39,12 +58,18 @@ class StoredObject(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    # 1-to-many relationship: An object is composed of ordered chunks
     chunks: Mapped[list["Chunk"]] = relationship(
         back_populates="object", cascade="all, delete-orphan", order_by="Chunk.chunk_index"
     )
 
 
 class Chunk(Base):
+    """
+    Chunk database entity.
+    
+    Represents a discrete part of an object (up to 1 MB) with its sequence index and SHA-256 checksum.
+    """
     __tablename__ = "chunks"
     __table_args__ = (UniqueConstraint("object_id", "chunk_index"),)
 
@@ -56,12 +81,18 @@ class Chunk(Base):
     status: Mapped[str] = mapped_column(String(16), default="stored")
 
     object: Mapped[StoredObject] = relationship(back_populates="chunks")
+    # 1-to-many relationship: A chunk has multiple physical replicas across workers
     replicas: Mapped[list["ChunkReplica"]] = relationship(
         back_populates="chunk", cascade="all, delete-orphan"
     )
 
 
 class ChunkReplica(Base):
+    """
+    Chunk replica database entity.
+    
+    Associates a chunk with the specific worker node storing that replica copy.
+    """
     __tablename__ = "chunk_replicas"
 
     chunk_id: Mapped[str] = mapped_column(

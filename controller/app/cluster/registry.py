@@ -1,4 +1,11 @@
-"""Registry of workers known to the controller."""
+"""
+Worker Registry.
+
+Provides higher-level cluster membership management:
+- Registering workers and reconciling their local chunk inventory on startup.
+- Processing periodic heartbeat updates.
+- Querying all workers or only healthy active workers for scheduler placement.
+"""
 from sqlalchemy.orm import Session
 
 from app.db.models import Chunk
@@ -9,13 +16,20 @@ from shared.models import WorkerHeartbeat, WorkerInfo, WorkerRegistration
 
 
 class WorkerRegistry:
+    """Manages worker registration, heartbeats, and cluster membership queries."""
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.workers = WorkerRepository(db)
         self.chunks = ChunkRepository(db)
 
     def register(self, registration: WorkerRegistration) -> WorkerInfo:
-        """Add or refresh a worker and reconcile its reported chunks."""
+        """
+        Add or refresh a worker and reconcile its locally stored chunks with the database.
+        
+        Updates worker base URL, marks it active, and verifies existing chunk replicas.
+        """
+        # Save or update worker record in database
         worker = self.workers.upsert(registration)
 
         # Reconcile reported chunks with chunk replicas in database
@@ -35,9 +49,11 @@ class WorkerRegistry:
         )
 
     def heartbeat(self, heartbeat: WorkerHeartbeat) -> None:
+        """Process a heartbeat ping from a worker, updating disk usage and last seen time."""
         self.workers.record_heartbeat(heartbeat.worker_id, heartbeat.used_bytes)
 
     def list_workers(self) -> list[WorkerInfo]:
+        """List all registered workers in the cluster regardless of status."""
         workers = self.workers.list_all()
         return [
             WorkerInfo(
@@ -52,6 +68,7 @@ class WorkerRegistry:
         ]
 
     def get_healthy_workers(self) -> list[WorkerInfo]:
+        """Retrieve only active workers suitable for storing or reading chunks."""
         workers = self.workers.list_by_status(WORKER_STATUS_ACTIVE)
         return [
             WorkerInfo(

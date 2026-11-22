@@ -1,4 +1,8 @@
-"""Wire-format models for the internal controller <-> worker HTTP APIs."""
+"""
+Shared Data Models for Internal HTTP Communication.
+Defines Pydantic wire models exchanged between controller and workers:
+worker registration, periodic heartbeats, chunk reports, and verification results.
+"""
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -7,16 +11,14 @@ from shared.constants import WORKER_STATUS_ACTIVE
 
 
 class ChunkReport(BaseModel):
-    """A chunk held by a worker, as reported by that worker."""
-
+    """Details of a chunk stored locally on a worker node."""
     chunk_id: str
     size_bytes: int
     checksum: str
 
 
 class WorkerRegistration(BaseModel):
-    """Sent by a worker to the controller on startup."""
-
+    """Payload sent by a worker to the controller during initial registration."""
     worker_id: str
     base_url: str = Field(description="URL the controller uses to reach this worker")
     capacity_bytes: int | None = None
@@ -25,8 +27,7 @@ class WorkerRegistration(BaseModel):
 
 
 class WorkerHeartbeat(BaseModel):
-    """Sent periodically by a worker to the controller."""
-
+    """Payload sent periodically by a worker to maintain active status with the controller."""
     worker_id: str
     used_bytes: int = 0
     chunk_count: int = 0
@@ -34,8 +35,7 @@ class WorkerHeartbeat(BaseModel):
 
 
 class WorkerInfo(BaseModel):
-    """Worker description as exposed by the controller."""
-
+    """Worker node description returned by controller APIs."""
     worker_id: str
     base_url: str
     status: str = WORKER_STATUS_ACTIVE
@@ -45,8 +45,7 @@ class WorkerInfo(BaseModel):
 
 
 class ChunkVerifyResult(BaseModel):
-    """Result of a worker re-hashing a stored chunk."""
-
+    """Checksum and existence response returned by worker /verify endpoint."""
     chunk_id: str
     exists: bool
     checksum: str | None = None

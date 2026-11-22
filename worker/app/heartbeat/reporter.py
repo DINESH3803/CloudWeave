@@ -1,4 +1,8 @@
-"""Registers with the controller and sends periodic heartbeats."""
+"""
+Heartbeat and Registration Reporter for Worker Nodes.
+Registers worker on boot with inventory of local chunks,
+and sends periodic heartbeats with current disk usage to the controller.
+"""
 import asyncio
 from datetime import datetime, timezone
 import logging
@@ -14,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class HeartbeatReporter:
+    """Manages background registration and periodic heartbeat transmissions to controller."""
+
     def __init__(self, store: ChunkStore, settings: WorkerSettings | None = None) -> None:
         self.store = store
         self.settings = settings or get_settings()
@@ -21,7 +27,7 @@ class HeartbeatReporter:
         self._running = False
 
     def build_registration(self) -> WorkerRegistration:
-        """Describe this worker and its stored chunks for the controller."""
+        """Construct registration payload with worker metadata and local chunk inventory."""
         chunks = self.store.list_chunks()
         return WorkerRegistration(
             worker_id=self.settings.worker_id,
@@ -32,6 +38,7 @@ class HeartbeatReporter:
         )
 
     def build_heartbeat(self) -> WorkerHeartbeat:
+        """Construct heartbeat payload reporting current disk usage and chunk count."""
         chunks = self.store.list_chunks()
         return WorkerHeartbeat(
             worker_id=self.settings.worker_id,
@@ -41,7 +48,7 @@ class HeartbeatReporter:
         )
 
     async def register(self) -> bool:
-        """POST registration to the controller, returns True on success."""
+        """Send registration POST request to the controller; returns True on success."""
         reg = self.build_registration()
         url = f"{self.settings.controller_url.rstrip('/')}{INTERNAL_API_PREFIX}/workers/register"
         headers = {INTERNAL_TOKEN_HEADER: self.settings.internal_api_token}
@@ -57,6 +64,7 @@ class HeartbeatReporter:
         return False
 
     async def send_heartbeat(self) -> bool:
+        """Send periodic heartbeat ping to controller; returns True on success."""
         hb = self.build_heartbeat()
         url = f"{self.settings.controller_url.rstrip('/')}{INTERNAL_API_PREFIX}/workers/heartbeat"
         headers = {INTERNAL_TOKEN_HEADER: self.settings.internal_api_token}
@@ -71,28 +79,32 @@ class HeartbeatReporter:
         return False
 
     async def _loop(self) -> None:
-        # Keep trying to register until controller is available
+        """Background asynchronous loop handling initial registration and recurring heartbeats."""
+        # 1. Keep retrying initial registration until controller is reachable
         registered = False
         while self._running and not registered:
             registered = await self.register()
             if not registered:
                 await asyncio.sleep(2.0)
 
+        # 2. Transmit heartbeats at configured intervals
         while self._running:
             await asyncio.sleep(self.settings.heartbeat_interval_seconds)
             if not self._running:
                 break
             success = await self.send_heartbeat()
+            # If heartbeat failed, attempt re-registration on next tick
             if not success:
-                # If heartbeat fails, attempt re-registration on next interval
                 logger.info("Heartbeat failed, will try re-registering...")
                 await self.register()
 
     def start(self) -> None:
+        """Start the background reporter task."""
         self._running = True
         self._task = asyncio.create_task(self._loop())
 
     def stop(self) -> None:
+        """Stop and cancel the background reporter task."""
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()

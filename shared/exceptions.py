@@ -1,37 +1,41 @@
-"""Domain exceptions shared by all CloudWeave components."""
+"""
+Domain Exceptions for CloudWeave.
+Shared exception hierarchy mapped to HTTP status codes by the controller
+and raised by workers, services, and client components.
+"""
 
 
 class CloudWeaveError(Exception):
-    """Base class for all CloudWeave errors."""
+    """Base exception class for all CloudWeave errors."""
 
 
 class ObjectNotFoundError(CloudWeaveError):
-    """The requested object does not exist."""
+    """Raised when an object ID does not exist in the metadata store (HTTP 404)."""
 
 
 class ChunkNotFoundError(CloudWeaveError):
-    """The requested chunk does not exist on the worker / in metadata."""
+    """Raised when a chunk ID does not exist on disk or in metadata (HTTP 404)."""
 
 
 class WorkerNotFoundError(CloudWeaveError):
-    """The referenced worker is not registered."""
+    """Raised when an operation references an unregistered worker (HTTP 404)."""
 
 
 class WorkerUnavailableError(CloudWeaveError):
-    """A worker could not be reached."""
+    """Raised when a worker cannot be contacted or is offline (HTTP 503)."""
 
 
 class NoHealthyWorkersError(CloudWeaveError):
-    """Not enough healthy workers to satisfy the replication factor."""
+    """Raised when there are not enough active workers to satisfy replication (HTTP 503)."""
 
 
 class ChecksumMismatchError(CloudWeaveError):
-    """Chunk or object data does not match its recorded checksum."""
+    """Raised when chunk data corruption or bitrot is detected (HTTP 500)."""
 
 
 class ConflictError(CloudWeaveError):
-    """The request conflicts with current state."""
+    """Raised on concurrent write conflict or invalid state transition (HTTP 409)."""
 
 
 class InvalidRequestError(CloudWeaveError):
-    """The request is invalid or malformed."""
+    """Raised on malformed or invalid request parameters (HTTP 400)."""

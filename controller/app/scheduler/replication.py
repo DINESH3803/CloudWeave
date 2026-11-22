@@ -1,4 +1,10 @@
-"""Replication management: keep every chunk at the configured replication factor."""
+"""
+Replication Manager.
+
+Enforces replication invariants across the cluster:
+- Detects under-replicated chunks (when a worker node goes down or fails).
+- Re-replicates missing chunk copies from healthy surviving replicas to alternative workers.
+"""
 import hashlib
 import logging
 
@@ -16,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 class ReplicationManager:
+    """Maintains target replica count (replication_factor) for all stored chunks."""
+
     def __init__(self, db: Session, placement: PlacementStrategy | None = None) -> None:
         self.db = db
         self.settings = get_settings()
@@ -25,17 +33,22 @@ class ReplicationManager:
         self.worker_client = WorkerClient(self.settings)
 
     def find_under_replicated(self) -> list[str]:
-        """Return IDs of chunks with fewer healthy replicas than the replication factor."""
+        """Identify chunk IDs that currently have fewer active replicas than configured."""
         chunks = self.chunks.find_under_replicated(self.settings.replication_factor)
         return [c.id for c in chunks]
 
     def replicate_chunk(self, chunk_id: str) -> None:
-        """Copy a chunk from a healthy replica to a new worker."""
+        """
+        Copy an under-replicated chunk from an intact replica to a new available worker.
+        
+        Reads valid chunk data from an active replica, selects a new target worker,
+        uploads the replica, and records it in the metadata database.
+        """
         chunk = self.chunks.get_chunk(chunk_id)
         if not chunk:
             return
 
-        # Find healthy replicas on active workers
+        # 1. Identify healthy replicas on active workers
         healthy_replicas = [
             r
             for r in chunk.replicas
@@ -47,11 +60,12 @@ class ReplicationManager:
             logger.warning("No healthy replica found to copy chunk %s from", chunk_id)
             return
 
-        # Fetch data from one healthy replica
+        # 2. Fetch and checksum-verify data from one healthy replica
         data: bytes | None = None
         for rep in healthy_replicas:
             try:
                 raw = self.worker_client.get_chunk(rep.worker.base_url, chunk_id)
+                # Ensure data matches the expected checksum before copying
                 if hashlib.sha256(raw).hexdigest() == chunk.checksum:
                     data = raw
                     break
@@ -64,7 +78,7 @@ class ReplicationManager:
             logger.error("Could not read valid chunk %s from any healthy replica", chunk_id)
             return
 
-        # Find candidate workers that do not already store this chunk
+        # 3. Find candidate workers that do not already hold a replica of this chunk
         existing_worker_ids = {r.worker_id for r in chunk.replicas}
         active_workers = self.workers.list_by_status(WORKER_STATUS_ACTIVE)
         candidates = [
@@ -84,10 +98,12 @@ class ReplicationManager:
             logger.info("No eligible worker available to receive replica of chunk %s", chunk_id)
             return
 
-        # Pick worker using placement strategy
+        # 4. Pick best worker using placement strategy (least loaded)
         chosen = self.placement.select_workers(chunk.chunk_index, candidates, 1)[0]
         try:
+            # Transfer chunk data to the new worker
             self.worker_client.put_chunk(chosen.base_url, chunk_id, data)
+            # Register new replica in database
             self.chunks.add_replica(chunk_id, chosen.worker_id, status=REPLICA_STATUS_STORED)
             w = self.workers.get(chosen.worker_id)
             if w:
@@ -98,7 +114,11 @@ class ReplicationManager:
             logger.warning("Failed to write restored replica to %s: %s", chosen.worker_id, e)
 
     def restore_replication(self) -> None:
-        """Re-replicate all under-replicated chunks (e.g. after a worker failure)."""
+        """
+        Scan and repair all under-replicated chunks in the cluster.
+        
+        Called automatically by the HealthMonitor when a worker goes down.
+        """
         under_replicated_ids = self.find_under_replicated()
         if under_replicated_ids:
             logger.info("Detected %d under-replicated chunks; restoring replication...", len(under_replicated_ids))

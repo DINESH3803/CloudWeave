@@ -1,159 +1,174 @@
 # CloudWeave — Mini Distributed Cloud Object Store
 
-CloudWeave is a distributed cloud object storage system built with Python 3.12, FastAPI, PostgreSQL, and Docker Compose. It stores arbitrary binary objects (documents, images, videos, audio, compressed files) by dividing them into 1 MB chunks and replicating each chunk across 4 persistent worker nodes with a replication factor of 2.
+CloudWeave is a fault-tolerant distributed cloud object store built with Python 3.12, FastAPI, PostgreSQL, and Docker Compose. It stores arbitrary binary files (documents, images, videos, audio, compressed archives) by splitting them into **1 MB chunks** and replicating each chunk across 4 persistent worker nodes with a strict **replication factor of 2**.
 
 ---
 
 ## 1. System Architecture
 
-```
-            ┌─────────┐   REST API    ┌──────────────────────┐    SQL     ┌────────────┐
-  client ──▶│  CLI /  │──────────────▶│      controller      │───────────▶│ PostgreSQL │
-            │ scripts │               │ (FastAPI, metadata,  │            └────────────┘
-            └─────────┘               │  placement, repair)  │
-                                      └──────────┬───────────┘
-                                internal HTTP    │  ▲ register / heartbeat
-                           ┌───────────┬─────────┼──┴────┬───────────┐
-                           ▼           ▼         ▼       ▼
-                        worker1     worker2   worker3  worker4   (each with persistent storage)
+```text
+            ┌─────────┐   REST API (/api/v1)   ┌──────────────────────┐    SQL     ┌────────────┐
+  client ──▶│  CLI /  │───────────────────────▶│      controller      │───────────▶│ PostgreSQL │
+            │ scripts │                        │ (FastAPI, metadata,  │ (port 5432)└────────────┘
+            └─────────┘                        │  placement, repair)  │
+                                               └──────────┬───────────┘
+                                         internal HTTP    │  ▲ register / heartbeat (5s)
+                                    ┌───────────┬─────────┼──┴────┬───────────┐
+                                    ▼           ▼         ▼       ▼
+                                 worker1     worker2   worker3  worker4   (persistent /data/chunks)
 ```
 
-- **Controller (`controller`)**: Single coordination node managing the client REST API, chunking/reassembly, object metadata, chunk placement, worker registry, heartbeat health monitoring, replication restoration, and integrity repair.
-- **Workers (`worker1` - `worker4`)**: 4 autonomous storage nodes that store chunks on persistent disk volumes (`/data/chunks`), register with the controller, emit periodic heartbeats, and serve internal chunk storage/retrieval/verification requests.
-- **PostgreSQL (`postgres`)**: Relational database storing metadata for objects, chunks, chunk replica mappings, and worker statuses.
+- **Controller (`controller`, port 8000)**: Coordinates upload chunking, download reassembly, least-loaded placement, worker registry, background health monitoring, under-replication healing, and metadata persistence.
+- **Workers (`worker1` to `worker4`, port 8001 internal)**: 4 autonomous storage nodes that persist chunk files on independent volumes (`/data/chunks`), send periodic heartbeats (every 5s), and serve internal chunk transfer requests.
+- **PostgreSQL (`postgres`, port 5432)**: Relational metadata database storing object records, chunk hashes, replica locations, and worker nodes.
 
 ---
 
-## 2. Prerequisites
+## 2. Prerequisites (Windows / PowerShell)
 
-- **Docker** (v20+ or Docker Desktop)
-- **Docker Compose** (v2+)
-- **Python 3.10+** (with `httpx` installed for running client CLI / demo scripts locally)
+Before setting up CloudWeave, make sure you have:
+1. **Docker Desktop for Windows** (with WSL2 backend enabled and running).
+2. **Python 3.10+** installed on Windows and added to your `PATH`.
+3. A terminal: **PowerShell** (recommended) or **Command Prompt (cmd)**.
 
 ---
 
-## 3. Quick Start
+## 3. Quick Setup from Scratch (Step-by-Step)
 
-### Step 1: Configure Environment
+### Step 1: Clone and Navigate to Project Directory
 
-```bash
-cp .env.example .env
+Open PowerShell and navigate to the project root:
+```powershell
+cd C:\Users\<YourUser>\...\CloudWeave
 ```
-*(Default settings in `.env` are pre-configured to run out of the box).*
 
-### Step 2: Build and Start the Cluster
+### Step 2: Set Up Python Virtual Environment (Local Host)
 
-```bash
+Create and activate a virtual environment for the client CLI and test tools:
+
+```powershell
+# Create virtual environment
+python -m venv venv
+
+# Activate virtual environment in PowerShell
+.\venv\Scripts\Activate.ps1
+
+# Install requirements (includes httpx, pytest, pydantic, etc.)
+pip install -r requirements.txt
+```
+
+*(If PowerShell blocks script execution, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` once in your session).*
+
+### Step 3: Configure Environment File
+
+Ensure `.env` exists in the repository root:
+```powershell
+Copy-Item .env.example .env -Force
+```
+*(The default settings in `.env` are pre-configured to work out of the box).*
+
+### Step 4: Build and Start the Cluster with Docker Compose
+
+Build the container images and start all 6 containers (`postgres`, `controller`, and `worker1` through `worker4`):
+
+```powershell
 docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 ```
 
-Verify that all 6 containers (`postgres`, `controller`, `worker1`, `worker2`, `worker3`, `worker4`) are up and healthy:
+### Step 5: Verify Cluster Health
 
-```bash
+Check that all 6 containers are running and healthy:
+```powershell
 docker compose --env-file .env -f deploy/docker-compose.yml ps
 ```
 
-The controller REST API is reachable at `http://localhost:8000`.
-- OpenAPI documentation: `http://localhost:8000/docs`
-- Health check: `http://localhost:8000/health`
-
-### Step 3: Tear Down
-
-```bash
-# Stop containers (preserves chunk and database volumes)
-docker compose --env-file .env -f deploy/docker-compose.yml down
-
-# Stop and wipe all data volumes
-docker compose --env-file .env -f deploy/docker-compose.yml down -v
+You can also check the cluster status directly via the client CLI:
+```powershell
+python -m client.cli cluster
 ```
+
+The controller web endpoints are available at:
+- **Interactive OpenAPI Documentation:** [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Controller Health Check:** [http://localhost:8000/health](http://localhost:8000/health)
 
 ---
 
 ## 4. Running the 6 Required Demonstrations
 
-An automated demonstration script is provided under `scripts/demo.py`. It showcases all 6 project requirements in sequence:
+An automated runner script is provided under `scripts/demo.py` to demonstrate and verify all 6 required project specifications:
 
-```bash
+```powershell
 python scripts/demo.py
 ```
 
-### Demonstration Scenarios Covered:
+### Demonstration Scenarios Executed:
+1. **Object Storage**: Uploads a 500 KB binary file and downloads it back, verifying byte-for-byte SHA-256 match.
+2. **Chunking & Distribution**: Uploads a 2.5 MB file (> 1 MB), verifies splitting into three 1 MB-bounded chunks (1 MB, 1 MB, 0.5 MB) and balanced distribution across workers.
+3. **Replication**: Inspects metadata to verify that every chunk has exactly 2 copies residing on distinct worker nodes.
+4. **Metadata Management**: Uploads custom metadata, retrieves it, and modifies metadata in-place via `PATCH` without re-uploading chunk data.
+5. **Worker Failure & Recovery**: Dynamically selects a replica worker, simulates a node crash with `docker stop <worker>`, downloads the object via the surviving replica, restarts the worker with `docker start <worker>`, and verifies replication factor restoration.
+6. **Data Integrity & Repair**: Intentionally corrupts a chunk file on a worker container, demonstrates detection of checksum mismatch, fallback to the intact replica, and automatic healing of the corrupted copy.
 
-1. **Object Storage (`demo 1`)**: Uploads an arbitrary binary file and downloads it back, verifying byte-for-byte SHA-256 match.
-2. **Chunking & Distribution (`demo 2`)**: Uploads a > 1 MB file (2.5 MB), verifies splitting into 1 MB chunks and fair distribution across workers.
-3. **Replication (`demo 3`)**: Inspects chunk metadata to prove each chunk has exactly 2 copies residing on distinct worker nodes.
-4. **Metadata Management (`demo 4`)**: Uploads custom metadata, retrieves it, and updates/patches metadata in-place via `PATCH` without re-uploading file bytes.
-5. **Worker Failure & Recovery (`demo 5`)**: Simulates node crash via `docker stop worker2`, proves downloads continue seamlessly from surviving replicas, verifies health detection, and restarts `worker2` with automatic re-registration.
-6. **Data Integrity & Corruption Repair (`demo 6`)**: Intentionally corrupts a chunk file on a worker's disk, attempts download to demonstrate automatic checksum mismatch detection and failover to a valid replica, followed by auto-repair of the corrupted chunk.
-
-You can also run an individual demo by index:
-```bash
+You can also run any specific scenario individually:
+```powershell
 python scripts/demo.py --demo 1
 python scripts/demo.py --demo 5
 ```
 
 ---
 
-## 5. Client CLI Usage
+## 5. Client CLI Usage (Interactive)
 
-The interactive client CLI is located in `client/cli.py`:
+The command-line interface is available via `python -m client.cli`:
 
-```bash
-# Upload an object with optional custom metadata
-python -m client.cli upload ./sample.pdf --metadata '{"category":"paper","author":"Alice"}'
+```powershell
+# Upload an object with custom JSON metadata
+python -m client.cli upload .\README.md --metadata '{"author":"Pardhiv","project":"CloudWeave"}'
 
-# List stored objects
+# List all stored objects
 python -m client.cli list
 
-# View detailed object metadata & chunk distribution
+# View complete metadata and chunk locations for an object
 python -m client.cli metadata <OBJECT_ID>
 
-# Patch custom metadata without re-uploading
-python -m client.cli patch-metadata <OBJECT_ID> '{"category":"archive","reviewed":true}'
+# Modify metadata in-place without re-uploading file chunks
+python -m client.cli patch-metadata <OBJECT_ID> '{"status":"approved","reviewer":"Dinesh"}'
 
-# Download an object
-python -m client.cli download <OBJECT_ID> ./downloaded_sample.pdf
+# Download and reassemble an object
+python -m client.cli download <OBJECT_ID> .\downloaded_file.bin
 
-# Delete an object and purge its chunks
+# Delete an object and purge its chunks across all workers
 python -m client.cli delete <OBJECT_ID>
 
-# Inspect cluster & worker status
+# Query cluster health and active workers
 python -m client.cli cluster
 ```
 
 ---
 
-## 6. REST API Specification
+## 6. Running the Automated Test Suite
 
-### Client API
+Run unit and integration tests using pytest:
 
-| Method | Endpoint | Description | Success Code |
-|---|---|---|---|
-| `POST` | `/api/v1/objects` | Upload file (`multipart/form-data`) with optional `metadata` JSON | `201 Created` |
-| `GET` | `/api/v1/objects/{object_id}` | Download complete reassembled original binary object | `200 OK` |
-| `GET` | `/api/v1/objects/{object_id}/metadata` | Retrieve system & custom metadata + chunk replica locations | `200 OK` |
-| `PATCH` | `/api/v1/objects/{object_id}/metadata` | Update custom metadata without re-uploading | `200 OK` |
-| `DELETE` | `/api/v1/objects/{object_id}` | Delete object and all associated chunk replicas | `204 No Content` |
-| `GET` | `/api/v1/objects` | List all stored objects with pagination (`offset`, `limit`) | `200 OK` |
-| `GET` | `/api/v1/cluster` | Cluster health and worker node status | `200 OK` |
-
-### Internal Worker API
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/internal/workers/register` | Worker registration with controller on startup |
-| `POST` | `/internal/workers/heartbeat` | Periodic worker heartbeat reporting availability and disk usage |
-| `GET` | `/internal/workers/{worker_id}/chunks` | Retrieve chunk inventory stored on a worker |
-| `PUT` | `/internal/chunks/{chunk_id}` | Store a chunk on a worker node |
-| `GET` | `/internal/chunks/{chunk_id}` | Retrieve raw chunk bytes from a worker node |
-| `DELETE` | `/internal/chunks/{chunk_id}` | Delete a chunk from a worker node |
-| `POST` / `GET` | `/internal/chunks/{chunk_id}/verify` | Check chunk integrity and return SHA-256 hash |
+```powershell
+python -m pytest tests/
+```
 
 ---
 
-## 7. Running Automated Tests
+## 7. Cluster Shutdown
 
-```bash
-# Run test suite
-python -m pytest tests/
+```powershell
+# Stop cluster containers (preserves worker and database volumes)
+docker compose --env-file .env -f deploy/docker-compose.yml down
+
+# Stop cluster and wipe all persistent storage volumes
+docker compose --env-file .env -f deploy/docker-compose.yml down -v
 ```
+
+---
+
+## 8. Documentation & Project Report
+
+The complete academic project report is located at:
+- **[docs/CloudWeave.md](file:///c:/Users/Pardh/.antigravity-ide/CloudWeave/docs/CloudWeave.md)**

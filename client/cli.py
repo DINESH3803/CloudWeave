@@ -1,4 +1,9 @@
-"""Command-line interface: `python -m client.cli --help` (run from the repo root)."""
+"""
+Command-Line Interface (CLI) for CloudWeave Object Store.
+Enables command-line interaction with the cluster:
+upload, download, list, metadata, patch-metadata, delete, cluster.
+Usage: python -m client.cli --help
+"""
 import argparse
 import json
 import os
@@ -9,6 +14,7 @@ from client.client import CloudWeaveClient
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Construct CLI argument parser and command definitions."""
     parser = argparse.ArgumentParser(prog="cloudweave", description="CloudWeave object store client")
     parser.add_argument(
         "--url",
@@ -17,44 +23,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # upload
+    # upload command
     up = sub.add_parser("upload", help="Upload a file")
     up.add_argument("path", type=Path, help="Path to local file")
     up.add_argument("--metadata", default="{}", help="Custom metadata as JSON string (e.g. '{\"author\":\"alice\"}')")
 
-    # download
+    # download command
     down = sub.add_parser("download", help="Download an object")
     down.add_argument("object_id", help="Object ID")
     down.add_argument("destination", type=Path, nargs="?", default=None, help="Destination file/folder path")
 
-    # list
+    # list command
     ls = sub.add_parser("list", help="List objects")
     ls.add_argument("--offset", type=int, default=0, help="Pagination offset")
     ls.add_argument("--limit", type=int, default=100, help="Pagination limit")
 
-    # metadata
+    # metadata command
     meta = sub.add_parser("metadata", help="Show object metadata")
     meta.add_argument("object_id", help="Object ID")
 
-    # patch-metadata
+    # patch-metadata command
     pm = sub.add_parser("patch-metadata", help="Update custom metadata without re-uploading file")
     pm.add_argument("object_id", help="Object ID")
     pm.add_argument("metadata_json", help="JSON string with custom metadata to update")
 
-    # delete
+    # delete command
     rm = sub.add_parser("delete", help="Delete an object")
     rm.add_argument("object_id", help="Object ID")
 
-    # cluster
+    # cluster command
     sub.add_parser("cluster", help="Show cluster status")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse command line arguments and execute the corresponding client operation."""
     args = build_parser().parse_args(argv)
     client = CloudWeaveClient(args.url)
     try:
         if args.command == "upload":
+            # Parse custom metadata JSON if specified
             metadata = {}
             if args.metadata:
                 try:
@@ -62,23 +70,28 @@ def main(argv: list[str] | None = None) -> int:
                 except json.JSONDecodeError as e:
                     print(f"Error parsing metadata JSON: {e}", file=sys.stderr)
                     return 1
+            # Execute upload and display response
             result = client.upload(args.path, metadata=metadata)
             print(json.dumps(result, indent=2))
 
         elif args.command == "download":
+            # Reassemble object and write to destination file
             dest = args.destination or Path(f"./downloaded_{args.object_id}")
             client.download(args.object_id, dest)
             print(f"Object {args.object_id} downloaded to {dest}")
 
         elif args.command == "list":
+            # Retrieve and print paginated object list
             result = client.list_objects(offset=args.offset, limit=args.limit)
             print(json.dumps(result, indent=2))
 
         elif args.command == "metadata":
+            # Retrieve and display object metadata with chunk breakdown
             result = client.metadata(args.object_id)
             print(json.dumps(result, indent=2))
 
         elif args.command == "patch-metadata":
+            # Parse JSON metadata patch and update object in-place
             try:
                 patch_data = json.loads(args.metadata_json)
             except json.JSONDecodeError as e:
@@ -88,10 +101,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, indent=2))
 
         elif args.command == "delete":
+            # Delete object chunks and metadata
             client.delete(args.object_id)
             print(f"Object {args.object_id} deleted successfully.")
 
         elif args.command == "cluster":
+            # Query and print cluster health and worker list
             result = client.cluster_status()
             print(json.dumps(result, indent=2))
 
@@ -99,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     finally:
+        # Ensure client session is closed
         client.close()
     return 0
 

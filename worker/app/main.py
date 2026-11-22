@@ -1,4 +1,11 @@
-"""CloudWeave storage worker entry point."""
+"""
+CloudWeave Storage Worker Entry Point.
+Manages worker startup lifecycle:
+- Configures standard stdout logging.
+- Creates local chunk storage folder on disk.
+- Spawns background HeartbeatReporter to register and heartbeat with the controller.
+- Serves internal chunk API routes (/internal/chunks) and health checks.
+"""
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -16,26 +23,33 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    """Manage worker startup registration, heartbeat reporter background loop, and shutdown."""
     settings = get_settings()
+    # Configure stdout logging format
     logging.basicConfig(
         level=settings.log_level.upper(),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         stream=sys.stdout,
     )
+    # Ensure persistent storage directory exists
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
     store = ChunkStore(settings.storage_dir)
+    # Start heartbeat reporter background task
     reporter = HeartbeatReporter(store, settings)
     reporter.start()
     logger.info("Worker %s started, storage=%s", settings.worker_id, settings.storage_dir)
     try:
         yield
     finally:
+        # Cleanly terminate reporter on process shutdown
         reporter.stop()
         logger.info("Worker %s stopped", settings.worker_id)
 
 
 def create_app() -> FastAPI:
+    """Create and configure FastAPI application for the storage worker."""
     app = FastAPI(title="CloudWeave Worker", lifespan=lifespan)
+    # Mount worker identity/health routes and internal chunk storage routes
     app.include_router(worker.router)
     app.include_router(chunks.router)
 
@@ -46,4 +60,5 @@ def create_app() -> FastAPI:
     return app
 
 
+# Application instance for ASGI server (uvicorn)
 app = create_app()

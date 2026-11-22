@@ -1,7 +1,8 @@
-# Run from the repository root:
-#   docker compose --env-file .env -f deploy/docker-compose.yml up --build
-# (or `make up`). Build context is the repo root so `shared/` is available to both images.
+# CloudWeave Cluster Deployment Configuration
+# Deploys 1 Controller, 4 Persistent Workers (worker1-4), and 1 PostgreSQL 16 metadata store.
+# Run from repository root: docker compose --env-file .env -f deploy/docker-compose.yml up --build
 
+# Common base service definition for all 4 worker nodes
 x-worker: &worker
   build:
     context: ..
@@ -11,6 +12,7 @@ x-worker: &worker
     - controller
   networks: [cloudweave]
 
+# Common environment variables shared by all storage workers
 x-worker-env: &worker-env
   CONTROLLER_URL: http://controller:8000
   INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
@@ -19,6 +21,7 @@ x-worker-env: &worker-env
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 services:
+  # Metadata database store (PostgreSQL 16)
   postgres:
     container_name: postgres
     image: postgres:16-alpine
@@ -36,6 +39,7 @@ services:
       retries: 10
     networks: [cloudweave]
 
+  # CloudWeave Controller (REST API, Chunk Scheduler, Health Monitor)
   controller:
     container_name: controller
     build:
@@ -56,6 +60,7 @@ services:
         condition: service_healthy
     networks: [cloudweave]
 
+  # Storage Worker 1
   worker1:
     <<: *worker
     container_name: worker1
@@ -66,6 +71,7 @@ services:
     volumes:
       - worker1_data:/data/chunks
 
+  # Storage Worker 2
   worker2:
     <<: *worker
     container_name: worker2
@@ -76,6 +82,7 @@ services:
     volumes:
       - worker2_data:/data/chunks
 
+  # Storage Worker 3
   worker3:
     <<: *worker
     container_name: worker3
@@ -86,6 +93,7 @@ services:
     volumes:
       - worker3_data:/data/chunks
 
+  # Storage Worker 4
   worker4:
     <<: *worker
     container_name: worker4
@@ -96,6 +104,7 @@ services:
     volumes:
       - worker4_data:/data/chunks
 
+# Persistent volume storage
 volumes:
   postgres_data:
   worker1_data:
@@ -103,5 +112,6 @@ volumes:
   worker3_data:
   worker4_data:
 
+# Internal bridge network for inter-container communication
 networks:
   cloudweave:

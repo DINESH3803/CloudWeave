@@ -1,4 +1,9 @@
-"""Read-only and update views over object, chunk and cluster metadata."""
+"""
+Metadata Service.
+
+Provides business logic for querying object and cluster metadata,
+and updating custom metadata in-place without altering chunk data.
+"""
 from sqlalchemy.orm import Session
 
 from app.cluster.registry import WorkerRegistry
@@ -11,6 +16,8 @@ from shared.models import WorkerInfo
 
 
 class MetadataService:
+    """Handles object and cluster metadata operations."""
+
     def __init__(self, db: Session) -> None:
         self.settings = get_settings()
         self.objects = ObjectRepository(db)
@@ -18,18 +25,27 @@ class MetadataService:
         self.registry = WorkerRegistry(db)
 
     def get_object_metadata(self, object_id: str) -> StoredObject:
-        """Return the object with its chunks and replica locations."""
+        """
+        Fetch complete metadata for an object including chunks and replica locations.
+        
+        Raises ObjectNotFoundError if the object does not exist.
+        """
         obj = self.objects.get(object_id)
         if not obj:
             raise ObjectNotFoundError(object_id)
         return obj
 
     def patch_custom_metadata(self, object_id: str, custom_metadata: dict) -> StoredObject:
-        """Update custom metadata without touching worker chunk storage."""
+        """
+        Update custom metadata key-values in-place without touching worker chunk files.
+        
+        Merges provided key-values; removes keys assigned a null value.
+        """
         obj = self.objects.update_custom_metadata(object_id, custom_metadata)
         if not obj:
             raise ObjectNotFoundError(object_id)
         return obj
 
     def get_cluster_workers(self) -> list[WorkerInfo]:
+        """Retrieve list of all registered workers with their statuses and disk usage."""
         return self.registry.list_workers()
