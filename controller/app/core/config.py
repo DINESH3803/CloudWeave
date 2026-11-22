@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     heartbeat_timeout_seconds: int = 15
     health_check_interval_seconds: int = 5
     worker_request_timeout_seconds: float = 10.0
+    # Connecting to a worker should be quick; a slow connect means it is unreachable.
+    worker_connect_timeout_seconds: float = 3.0
+    # Best-effort removal of an unrecorded copy after a failed/uncertain write.
+    worker_cleanup_timeout_seconds: float = 2.0
+
+    # Replication reconciliation (level-triggered restoration of the replication factor)
+    replication_reconcile_interval_seconds: float = 10.0
+    replication_retry_base_seconds: float = 5.0
+    replication_retry_max_seconds: float = 120.0
 
     # Shared secret header token for internal controller <-> worker communication
     internal_api_token: str = "change-me"

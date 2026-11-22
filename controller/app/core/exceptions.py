@@ -1,12 +1,9 @@
-"""
-Controller Exception Mapping.
-
-Maps internal domain exceptions to appropriate HTTP status codes and JSON responses
-according to the project specification (200, 201, 204, 400, 404, 409, 500, 503).
-"""
+"""Controller exceptions and their mapping to HTTP responses."""
+import logging
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from shared.exceptions import (
     ChecksumMismatchError,
@@ -15,45 +12,66 @@ from shared.exceptions import (
     ConflictError,
     InvalidRequestError,
     NoHealthyWorkersError,
+    ObjectIntegrityError,
     ObjectNotFoundError,
     WorkerNotFoundError,
     WorkerUnavailableError,
 )
 
+logger = logging.getLogger(__name__)
+
 __all__ = ["CloudWeaveError", "install_exception_handlers"]
 
-# Mapping from domain exception classes to HTTP status codes
 _STATUS_BY_EXCEPTION: dict[type[Exception], int] = {
-    ObjectNotFoundError: 404,       # Requested object ID not found in metadata
-    ChunkNotFoundError: 404,        # Requested chunk ID not found
-    WorkerNotFoundError: 404,       # Worker ID not registered
-    InvalidRequestError: 400,       # Bad input or malformed request parameters
-    ConflictError: 409,             # Concurrent write or state conflict
-    NoHealthyWorkersError: 503,     # Not enough active workers available for placement
-    WorkerUnavailableError: 503,    # Worker node is dead or unreachable
-    ChecksumMismatchError: 500,     # Data integrity corruption detected
+    ObjectNotFoundError: 404,
+    ChunkNotFoundError: 404,
+    WorkerNotFoundError: 404,
+    InvalidRequestError: 400,
+    ConflictError: 409,
+    NoHealthyWorkersError: 503,
+    WorkerUnavailableError: 503,
+    ChecksumMismatchError: 500,
+    ObjectIntegrityError: 500,
 }
 
 
 def install_exception_handlers(app: FastAPI) -> None:
-    """
-    Register global exception handlers on the FastAPI app.
-    
-    Catches CloudWeave domain errors and validation errors, converting them into
-    clean JSON error payloads with correct HTTP status codes.
-    """
     @app.exception_handler(CloudWeaveError)
     async def _cloudweave_error(_: Request, exc: CloudWeaveError) -> JSONResponse:
-        # Resolve status code from map, defaulting to 500 for unmapped errors
         status = _STATUS_BY_EXCEPTION.get(type(exc), 500)
-        return JSONResponse(status_code=status, content={"detail": str(exc) or type(exc).__name__})
+        msg = str(exc) or type(exc).__name__
+        if isinstance(exc, ObjectNotFoundError) and not msg.startswith("Object "):
+            msg = f"Object {msg} not found" if msg else "Object not found"
+        return JSONResponse(status_code=status, content={"detail": msg})
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-        # Return 400 Bad Request on invalid request schemas/parameters
-        return JSONResponse(status_code=400, content={"detail": str(exc.errors())})
+        messages = []
+        for err in exc.errors():
+            loc = err.get("loc", ())
+            field = str(loc[-1]) if loc else ""
+            if field == "offset":
+                messages.append("offset must be greater than or equal to 0")
+            elif field == "limit":
+                messages.append("limit must be between 1 and 1000")
+            else:
+                msg = err.get("msg", "Invalid value")
+                messages.append(f"{field}: {msg}" if field else msg)
+
+        detail = "; ".join(messages) if len(messages) > 1 else (messages[0] if messages else "Invalid request parameters")
+        return JSONResponse(status_code=400, content={"detail": detail})
 
     @app.exception_handler(NotImplementedError)
     async def _not_implemented(_: Request, exc: NotImplementedError) -> JSONResponse:
-        # Return 501 Not Implemented
         return JSONResponse(status_code=501, content={"detail": str(exc) or "Not implemented yet"})
+
+    @app.exception_handler(Exception)
+    async def _unhandled_exception(_: Request, exc: Exception) -> JSONResponse:
+        if isinstance(exc, StarletteHTTPException):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=getattr(exc, "headers", None),
+            )
+        logger.exception("Unhandled server error: %s", exc)
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})

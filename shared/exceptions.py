@@ -1,41 +1,49 @@
-"""
-Domain Exceptions for CloudWeave.
-Shared exception hierarchy mapped to HTTP status codes by the controller
-and raised by workers, services, and client components.
-"""
+"""Domain exceptions shared by all CloudWeave components."""
 
 
 class CloudWeaveError(Exception):
-    """Base exception class for all CloudWeave errors."""
+    """Base class for all CloudWeave errors."""
 
 
 class ObjectNotFoundError(CloudWeaveError):
-    """Raised when an object ID does not exist in the metadata store (HTTP 404)."""
+    """The requested object does not exist."""
+
+    def __init__(self, object_id: str | None = None) -> None:
+        self.object_id = object_id
+        if object_id:
+            msg = object_id if object_id.startswith("Object ") else f"Object {object_id} not found"
+        else:
+            msg = "Object not found"
+        super().__init__(msg)
 
 
 class ChunkNotFoundError(CloudWeaveError):
-    """Raised when a chunk ID does not exist on disk or in metadata (HTTP 404)."""
+    """The requested chunk does not exist on the worker / in metadata."""
 
 
 class WorkerNotFoundError(CloudWeaveError):
-    """Raised when an operation references an unregistered worker (HTTP 404)."""
+    """The referenced worker is not registered."""
 
 
 class WorkerUnavailableError(CloudWeaveError):
-    """Raised when a worker cannot be contacted or is offline (HTTP 503)."""
+    """A worker could not be reached."""
 
 
 class NoHealthyWorkersError(CloudWeaveError):
-    """Raised when there are not enough active workers to satisfy replication (HTTP 503)."""
+    """Not enough healthy workers to satisfy the replication factor."""
 
 
 class ChecksumMismatchError(CloudWeaveError):
-    """Raised when chunk data corruption or bitrot is detected (HTTP 500)."""
+    """Chunk or object data does not match its recorded checksum."""
 
 
 class ConflictError(CloudWeaveError):
-    """Raised on concurrent write conflict or invalid state transition (HTTP 409)."""
+    """The request conflicts with current state."""
 
 
 class InvalidRequestError(CloudWeaveError):
-    """Raised on malformed or invalid request parameters (HTTP 400)."""
+    """The request is invalid or malformed."""
+
+
+class ObjectIntegrityError(CloudWeaveError):
+    """Reconstructed object fails size or checksum validation."""

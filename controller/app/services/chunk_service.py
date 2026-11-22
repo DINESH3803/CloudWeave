@@ -1,12 +1,4 @@
-"""
-Chunk Service.
-
-Handles chunk-level operations:
-- Splitting binary streams into fixed 1 MB byte segments.
-- Placing chunk replicas onto distinct worker nodes.
-- Retrieving chunks with transparent failover and automatic corruption healing.
-- Cascading deletion of chunks across worker nodes.
-"""
+"""Chunk-level operations: splitting data, placing and fetching chunks."""
 from collections.abc import Iterator
 import hashlib
 import logging
@@ -30,19 +22,19 @@ from shared.models import WorkerInfo
 logger = logging.getLogger(__name__)
 
 
+def _failure_reason(err: BaseException) -> str:
+    """Short, URL-free description of a worker call failure (e.g. 'ReadTimeout')."""
+    cause = err.__cause__ or err
+    return type(cause).__name__
+
+
 def split_into_chunks(stream: BinaryIO, chunk_size: int) -> Iterator[bytes]:
-    """
-    Read binary stream in successive blocks of size `chunk_size` (1 MB).
-    
-    The final chunk block may be smaller than chunk_size.
-    """
+    """Yield successive chunk_size blocks from a binary stream (last may be shorter)."""
     while block := stream.read(chunk_size):
         yield block
 
 
 class ChunkService:
-    """Manages chunk storage, replica placement, retrieval, and auto-repair."""
-
     def __init__(
         self,
         db: Session,
@@ -62,28 +54,62 @@ class ChunkService:
         chunk_index: int,
         data: bytes,
         candidates: list[WorkerInfo],
+        failed_workers: set[str] | None = None,
     ) -> str:
+        """Write ``replication_factor`` verified replicas of one chunk, then record metadata.
+
+        Candidates are tried in placement-preference order; workers that already failed
+        earlier in the same upload (``failed_workers``, updated in place) are tried last.
+        If a write fails, times out, or the stored copy does not verify, the next eligible
+        worker is tried; each worker is tried at most once per chunk. A replica counts only
+        after the PUT succeeded and the worker reports the expected SHA-256. Copies that
+        may exist but cannot be recorded are deleted best-effort. Metadata is written only
+        once enough verified copies exist; otherwise WorkerUnavailableError is raised and
+        nothing is recorded for this chunk.
         """
-        Compute checksum, select worker nodes, write replicas, and record chunk in database.
-        
-        Uses the placement strategy to select distinct workers maintaining replication factor 2.
-        """
-        # 1. Format deterministic chunk ID and compute SHA-256 checksum
+        rf = self.settings.replication_factor
         chunk_id = f"{object_id}_{chunk_index}"
         checksum = hashlib.sha256(data).hexdigest()
+        failed_workers = failed_workers if failed_workers is not None else set()
 
-        # 2. Select distinct workers based on least load
-        selected_workers = self.placement.select_workers(
+        ranked = self.placement.select_workers(
             chunk_index=chunk_index,
             candidates=candidates,
-            count=self.settings.replication_factor,
+            count=len(candidates),
         )
+        ordered = [w for w in ranked if w.worker_id not in failed_workers] + [
+            w for w in ranked if w.worker_id in failed_workers
+        ]
 
-        # 3. Transmit chunk bytes to selected worker nodes
-        for worker in selected_workers:
-            self.worker_client.put_chunk(worker.base_url, chunk_id, data)
+        selected_workers: list[WorkerInfo] = []
+        errors: list[str] = []
+        for worker in ordered:
+            if len(selected_workers) >= rf:
+                break
+            reason = self._write_verified_replica(worker, chunk_id, data, checksum)
+            if reason is None:
+                selected_workers.append(worker)
+            else:
+                failed_workers.add(worker.worker_id)
+                errors.append(f"{worker.worker_id}: {reason}")
+                logger.warning(
+                    "Chunk %s: replica on %s failed (%s); trying next eligible worker", chunk_id, worker.worker_id, reason
+                )
 
-        # 4. Save chunk metadata record in database
+        if len(selected_workers) < rf:
+            # Not enough verified copies: remove the ones we wrote (nothing is recorded).
+            for worker in selected_workers:
+                self._discard_copy(worker, chunk_id, timeout=None)
+            raise WorkerUnavailableError(
+                f"Could not store chunk {chunk_id} on {rf} workers: {len(selected_workers)} succeeded"
+                f" ({'; '.join(errors) if errors else 'no eligible workers'})"
+            )
+        if errors:
+            logger.info(
+                "Chunk %s stored on %s after %d failed attempt(s)",
+                chunk_id, ", ".join(w.worker_id for w in selected_workers), len(errors),
+            )
+
         self.chunks.add_chunk(
             chunk_id=chunk_id,
             object_id=object_id,
@@ -92,9 +118,9 @@ class ChunkService:
             checksum=checksum,
         )
 
-        # 5. Save replica mappings and update disk usage accounting
         for worker in selected_workers:
             self.chunks.add_replica(chunk_id, worker.worker_id, status=REPLICA_STATUS_STORED)
+            # Update candidate used_bytes locally and in DB
             worker.used_bytes += len(data)
             w = self.workers.get(worker.worker_id)
             if w:
@@ -103,39 +129,61 @@ class ChunkService:
         self.db.commit()
         return chunk_id
 
+    def _write_verified_replica(self, worker: WorkerInfo, chunk_id: str, data: bytes, checksum: str) -> str | None:
+        """PUT one replica and verify it. Returns None on success, else a short reason."""
+        try:
+            self.worker_client.put_chunk(worker.base_url, chunk_id, data)
+        except Exception as e:
+            # A timeout does not prove nothing was written: remove any copy best-effort.
+            self._discard_copy(worker, chunk_id, timeout=self.settings.worker_cleanup_timeout_seconds)
+            return _failure_reason(e)
+        try:
+            result = self.worker_client.verify_chunk(worker.base_url, chunk_id)
+        except Exception as e:
+            result = None
+            logger.warning("Chunk %s: verification on %s failed: %s", chunk_id, worker.worker_id, _failure_reason(e))
+        if result is None or not result.exists or result.checksum != checksum:
+            self._discard_copy(worker, chunk_id, timeout=self.settings.worker_cleanup_timeout_seconds)
+            return "stored copy failed checksum verification"
+        return None
+
+    def _discard_copy(self, worker: WorkerInfo, chunk_id: str, timeout: float | None) -> None:
+        """Best-effort removal of an unrecorded copy; failures are logged, never raised."""
+        try:
+            self.worker_client.delete_chunk(worker.base_url, chunk_id, timeout=timeout)
+        except Exception as e:
+            logger.warning(
+                "Chunk %s: could not remove unrecorded copy from %s: %s", chunk_id, worker.worker_id, _failure_reason(e)
+            )
+
     def read_chunk(self, chunk_id: str) -> bytes:
-        """
-        Retrieve chunk data from a healthy replica with failover and auto-repair.
-        
-        Validates SHA-256 checksum. If corrupted, falls back to another replica
-        and repairs the damaged replica using the valid data.
-        """
+        """Fetch from a healthy replica, verify checksum, fall back to another replica."""
         chunk = self.chunks.get_chunk(chunk_id)
         if not chunk:
             raise ChunkNotFoundError(chunk_id)
 
-        # Prioritize replicas on active workers
+        # Order replicas to prioritize active workers, then sort deterministically by worker_id
         sorted_replicas = sorted(
             chunk.replicas,
-            key=lambda r: 0 if (r.worker and r.worker.status == WORKER_STATUS_ACTIVE) else 1,
+            key=lambda r: (
+                0 if (r.worker and r.worker.status == WORKER_STATUS_ACTIVE) else 1,
+                r.worker_id,
+            ),
         )
 
         valid_data: bytes | None = None
         corrupted_replicas = []
 
-        # Attempt to read from each replica until a checksum-verified copy is obtained
         for replica in sorted_replicas:
             if not replica.worker:
                 continue
             try:
                 raw = self.worker_client.get_chunk(replica.worker.base_url, chunk_id)
                 computed = hashlib.sha256(raw).hexdigest()
-                # Verify chunk integrity against stored checksum
                 if computed == chunk.checksum:
                     valid_data = raw
                     break
                 else:
-                    # Corruption detected: mark replica and continue to next replica
                     logger.warning(
                         "Data corruption detected on worker %s for chunk %s (checksum mismatch)",
                         replica.worker_id,
@@ -145,14 +193,12 @@ class ChunkService:
                     corrupted_replicas.append(replica)
                     self.db.commit()
             except Exception as e:
-                # Worker offline or unreachable: fall back to next replica
                 logger.warning("Failed to fetch chunk %s from %s: %s", chunk_id, replica.worker_id, e)
 
-        # If all replicas failed or were corrupted, raise 503
         if valid_data is None:
             raise WorkerUnavailableError(f"No accessible and uncorrupted replica for chunk {chunk_id}")
 
-        # Auto-repair: restore valid data onto any replica that had corruption
+        # If any replica was corrupted, auto-repair it in background/inline using valid_data!
         for corrupt_rep in corrupted_replicas:
             if corrupt_rep.worker and corrupt_rep.worker.status == WORKER_STATUS_ACTIVE:
                 try:
@@ -167,11 +213,10 @@ class ChunkService:
         return valid_data
 
     def delete_chunk(self, chunk_id: str) -> None:
-        """Instruct all workers holding a replica of this chunk to delete their chunk file."""
+        """Remove every replica of the chunk from workers."""
         chunk = self.chunks.get_chunk(chunk_id)
         if not chunk:
             return
-        # Remove replica files from each worker node
         for replica in chunk.replicas:
             if replica.worker:
                 try:

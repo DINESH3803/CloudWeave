@@ -1,15 +1,8 @@
-"""
-Object Service.
-
-Handles high-level object lifecycle operations:
-- Uploading binary streams: chunking into 1 MB parts, replicating across workers, saving metadata.
-- Downloading objects: reassembling ordered chunks transparently with failover.
-- Listing objects with pagination.
-- Object deletion: cascading cleanup of chunks across worker nodes.
-"""
+"""Object-level operations used by the client-facing API."""
 from collections.abc import Iterator
 import hashlib
 import logging
+import tempfile
 from typing import BinaryIO
 
 from sqlalchemy.orm import Session
@@ -24,17 +17,21 @@ from shared.constants import (
     OBJECT_STATUS_DELETING,
     OBJECT_STATUS_UPLOADING,
 )
-from shared.exceptions import NoHealthyWorkersError, ObjectNotFoundError
+from shared.exceptions import (
+    ChecksumMismatchError,
+    NoHealthyWorkersError,
+    ObjectIntegrityError,
+    ObjectNotFoundError,
+    WorkerUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
-# Precomputed SHA-256 hex digest for an empty 0-byte file
 EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+_STREAM_BLOCK = 256 * 1024  # 256 KiB read blocks for response streaming
 
 
 class ObjectService:
-    """Business logic for object creation, streaming, listing, and deletion."""
-
     def __init__(self, db: Session) -> None:
         self.db = db
         self.settings = get_settings()
@@ -49,12 +46,7 @@ class ObjectService:
         stream: BinaryIO,
         custom_metadata: dict | None = None,
     ) -> StoredObject:
-        """
-        Split upload stream into chunks, store replicas across workers, and mark object available.
-        
-        Ensures atomic rollback: if upload fails midway, already-written chunks are cleaned up.
-        """
-        # 1. Verify enough healthy workers are available to satisfy replication factor
+        """Chunk the stream, store replicas across workers, then mark the object available."""
         healthy_workers = self.registry.get_healthy_workers()
         if len(healthy_workers) < self.settings.replication_factor:
             raise NoHealthyWorkersError(
@@ -62,7 +54,7 @@ class ObjectService:
                 f"minimum required replication factor is {self.settings.replication_factor}"
             )
 
-        # 2. Create the initial database record in UPLOADING status
+        # Create the initial record in UPLOADING state
         obj = self.objects.create(
             name=name,
             content_type=content_type or "application/octet-stream",
@@ -71,12 +63,12 @@ class ObjectService:
         )
 
         stored_chunk_ids: list[str] = []
+        failed_workers: set[str] = set()  # workers that failed during this upload are tried last
         file_hasher = hashlib.sha256()
         total_size = 0
         chunk_index = 0
 
         try:
-            # 3. Read stream in 1 MB blocks and distribute replicas across workers
             for block in split_into_chunks(stream, self.settings.chunk_size_bytes):
                 file_hasher.update(block)
                 total_size += len(block)
@@ -85,11 +77,12 @@ class ObjectService:
                     chunk_index=chunk_index,
                     data=block,
                     candidates=healthy_workers,
+                    failed_workers=failed_workers,
                 )
                 stored_chunk_ids.append(chunk_id)
                 chunk_index += 1
 
-            # 4. Finalize object record metadata and mark AVAILABLE
+            # Complete upload record
             obj.size_bytes = total_size
             obj.checksum = file_hasher.hexdigest() if chunk_index > 0 else EMPTY_SHA256
             obj.chunk_count = chunk_index
@@ -100,60 +93,122 @@ class ObjectService:
             return obj
 
         except Exception as e:
-            # Rollback: Clean up any chunks written to workers before failing
             logger.exception("Upload failed for object %s: %s; cleaning up chunks...", obj.id, e)
-            for cid in stored_chunk_ids:
-                try:
-                    self.chunk_service.delete_chunk(cid)
-                except Exception:
-                    pass
-            self.objects.delete(obj.id)
-            raise
+            self._cleanup_failed_upload(obj.id, stored_chunk_ids)
+            raise  # always the original error; cleanup problems are only logged
 
-    def download(self, object_id: str) -> Iterator[bytes]:
-        """
-        Yield object byte stream by retrieving and reassembling chunks sequentially.
-        
-        Reads chunks in order (chunk 0, 1, 2...) transparently to the caller.
+    def _cleanup_failed_upload(self, object_id: str, chunk_ids: list[str]) -> None:
+        """Remove what a failed upload stored. Never raises."""
+        try:
+            self.db.rollback()  # the failure may have left the session needing a rollback
+        except Exception as e:
+            logger.warning("Cleanup of failed upload %s: rollback failed: %s", object_id, type(e).__name__)
+        for cid in chunk_ids:
+            try:
+                self.chunk_service.delete_chunk(cid)
+            except Exception as e:
+                logger.warning("Cleanup of failed upload %s: could not delete chunk %s: %s", object_id, cid, type(e).__name__)
+        try:
+            self.objects.delete(object_id)
+        except Exception as e:
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "Cleanup of failed upload %s: could not remove its metadata (%s); it remains in 'uploading' state",
+                object_id, type(e).__name__,
+            )
+
+    def download(self, object_id: str) -> tuple[StoredObject, Iterator[bytes]]:
+        """Retrieve the complete object into a spooled temp file, validate it, then return a streaming iterator.
+
+        All retrieval and validation is completed BEFORE returning. If anything fails,
+        an exception is raised here — before any HTTP response headers are sent.
         """
         obj = self.get(object_id)
-        if obj.chunk_count == 0:
-            yield b""
-            return
 
-        # Stream chunks one by one
-        for chunk in obj.chunks:
-            yield self.chunk_service.read_chunk(chunk.id)
+        if obj.chunk_count == 0:
+            # Empty object: nothing to retrieve or validate.
+            return obj, iter([b""])
+
+        # Retrieve all chunks into a spooled temporary file.
+        # SpooledTemporaryFile stays in memory up to max_size, then spills to disk.
+        tmp = tempfile.SpooledTemporaryFile(max_size=10 * 1024 * 1024)
+        try:
+            reconstructed_size = 0
+            obj_hasher = hashlib.sha256()
+
+            chunks = sorted(obj.chunks, key=lambda c: c.chunk_index)
+            if len(chunks) != obj.chunk_count:
+                raise ObjectIntegrityError(
+                    f"Object {object_id}: expected {obj.chunk_count} chunk(s), "
+                    f"found {len(chunks)} in metadata"
+                )
+
+            for chunk_meta in chunks:
+                chunk_data = self.chunk_service.read_chunk(chunk_meta.id)
+                # read_chunk already verifies per-chunk checksum and falls back to alternates.
+                # Double-check here as a defence against bugs in read_chunk.
+                computed = hashlib.sha256(chunk_data).hexdigest()
+                if computed != chunk_meta.checksum:
+                    raise ChecksumMismatchError(
+                        f"Chunk {chunk_meta.id} checksum mismatch after retrieval"
+                    )
+                tmp.write(chunk_data)
+                reconstructed_size += len(chunk_data)
+                obj_hasher.update(chunk_data)
+
+            # Validate reconstructed size.
+            if reconstructed_size != obj.size_bytes:
+                raise ObjectIntegrityError(
+                    f"Object {object_id}: reconstructed size {reconstructed_size} "
+                    f"does not match stored size {obj.size_bytes}"
+                )
+
+            # Validate final object checksum if present.
+            if obj.checksum and obj.checksum != EMPTY_SHA256:
+                final_checksum = obj_hasher.hexdigest()
+                if final_checksum != obj.checksum:
+                    raise ObjectIntegrityError(
+                        f"Object {object_id}: final checksum mismatch"
+                    )
+
+            # All checks passed. Seek to beginning and return a streaming generator.
+            tmp.seek(0)
+
+        except Exception:
+            tmp.close()
+            raise
+
+        def _stream(spooled: tempfile.SpooledTemporaryFile) -> Iterator[bytes]:  # type: ignore[type-arg]
+            try:
+                while True:
+                    block = spooled.read(_STREAM_BLOCK)
+                    if not block:
+                        break
+                    yield block
+            finally:
+                spooled.close()
+
+        return obj, _stream(tmp)
 
     def get(self, object_id: str) -> StoredObject:
-        """
-        Fetch object record by ID.
-        
-        Raises ObjectNotFoundError if the record does not exist.
-        """
         obj = self.objects.get(object_id)
         if not obj:
             raise ObjectNotFoundError(object_id)
         return obj
 
     def list(self, offset: int = 0, limit: int = 100) -> tuple[list[StoredObject], int]:
-        """Fetch a paginated list of objects and total record count."""
         return self.objects.list(offset, limit)
 
     def delete(self, object_id: str) -> None:
-        """
-        Delete an object and clean up all its chunk replicas from worker nodes.
-        
-        Sets status to DELETING, purges worker chunks, and removes DB record.
-        """
+        """Delete chunks from workers, then remove metadata."""
         obj = self.get(object_id)
-        # Mark object as deleting to prevent concurrent downloads
         self.objects.update_status(object_id, OBJECT_STATUS_DELETING)
 
-        # Delete chunk files from worker nodes
         for chunk in obj.chunks:
             self.chunk_service.delete_chunk(chunk.id)
 
-        # Remove object record from metadata database
         self.objects.delete(object_id)
         logger.info("Deleted object %s and its chunks", object_id)

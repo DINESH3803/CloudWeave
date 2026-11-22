@@ -101,13 +101,14 @@ An automated runner script is provided under `scripts/demo.py` to demonstrate an
 python scripts/demo.py
 ```
 
-### Demonstration Scenarios Executed:
-1. **Object Storage**: Uploads a 500 KB binary file and downloads it back, verifying byte-for-byte SHA-256 match.
-2. **Chunking & Distribution**: Uploads a 2.5 MB file (> 1 MB), verifies splitting into three 1 MB-bounded chunks (1 MB, 1 MB, 0.5 MB) and balanced distribution across workers.
-3. **Replication**: Inspects metadata to verify that every chunk has exactly 2 copies residing on distinct worker nodes.
-4. **Metadata Management**: Uploads custom metadata, retrieves it, and modifies metadata in-place via `PATCH` without re-uploading chunk data.
-5. **Worker Failure & Recovery**: Dynamically selects a replica worker, simulates a node crash with `docker stop <worker>`, downloads the object via the surviving replica, restarts the worker with `docker start <worker>`, and verifies replication factor restoration.
-6. **Data Integrity & Repair**: Intentionally corrupts a chunk file on a worker container, demonstrates detection of checksum mismatch, fallback to the intact replica, and automatic healing of the corrupted copy.
+### Demonstration Scenarios Covered:
+
+1. **Object Storage (`demo 1`)**: Uploads an arbitrary binary file and downloads it back, verifying byte-for-byte SHA-256 match.
+2. **Chunking & Distribution (`demo 2`)**: Uploads a > 1 MB file (2.5 MB), verifies splitting into 1 MB chunks and fair distribution across workers.
+3. **Replication (`demo 3`)**: Inspects chunk metadata to prove each chunk has exactly 2 copies residing on distinct worker nodes.
+4. **Metadata Management (`demo 4`)**: Uploads custom metadata, retrieves it, and updates/patches metadata in-place via `PATCH` without re-uploading file bytes.
+5. **Worker Failure & Recovery (`demo 5`)**: Uploads a dedicated test object with replicas on `worker2`, displays initial worker health and replica locations, stops `worker2` via `docker stop worker2`, polls health monitor until failure is detected (`worker2` marked unhealthy), displays during-failure state and successfully downloads/verifies the object via surviving replicas, waits for replication reconciliation to restore 2 usable copies per chunk on surviving healthy workers, restarts `worker2` via `docker start worker2`, polls until `worker2` re-registers as active, and cleans up the temporary demonstration object.
+6. **Data Integrity & Corruption Repair (`demo 6`)**: Uploads a dedicated test object, identifies the first-queried replica deterministically, records initial on-disk SHA-256 checksum, intentionally corrupts the chunk file on the target worker's disk and verifies checksum mismatch, downloads the object via the client API to demonstrate corruption detection and seamless fallback to a valid replica, verifies that read-repair restores the corrupted worker replica to its valid on-disk SHA-256 and `stored` status, and cleans up the temporary demonstration object.
 
 You can also run any specific scenario individually:
 ```powershell
